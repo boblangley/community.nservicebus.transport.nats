@@ -15,8 +15,8 @@
     <Authors>Community</Authors>
     <PackageTags>NServiceBus;NATS;JetStream;transport;messaging;distributed;microservices</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <PackageProjectUrl>https://github.com/community/nservicebus-transport-nats</PackageProjectUrl>
-    <RepositoryUrl>https://github.com/community/nservicebus-transport-nats.git</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/boblangley/community.nservicebus.transport.nats</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/boblangley/community.nservicebus.transport.nats.git</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
