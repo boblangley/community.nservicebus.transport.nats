@@ -1,3 +1,8 @@
+![NuGet Version](https://img.shields.io/nuget/v/community.nservicebus.transport.nats?style=flat&link=https%3A%2F%2Fwww.nuget.org%2Fpackages%2FCommunity.NServiceBus.Transport.Nats%2F)
+![GitHub Release](https://img.shields.io/github/v/release/boblangley/community.nservicebus.transport.nats)
+![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/boblangley/community.nservicebus.transport.nats/release.yml)
+
+
 # Community.NServiceBus.Transport.Nats
 
 A NATS JetStream transport for NServiceBus.
