@@ -1,0 +1,31 @@
+services:
+  devcontainer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ..:/workspace/community.nservicebus.transport.nats:cached
+      - /var/run/docker.sock:/var/run/docker.sock
+      - claude:/home/vscode/.claude
+    command: sleep infinity
+    networks:
+      - community-nservicebus-transport-nats
+    depends_on:
+      - nats
+
+  nats:
+    image: nats:2.10-alpine
+    command:
+      - "--jetstream"
+      - "-m"
+      - "8222"
+    networks:
+      - community-nservicebus-transport-nats
+
+networks:
+  community-nservicebus-transport-nats:
+    driver: bridge
+
+volumes:
+  claude:
+    external: true

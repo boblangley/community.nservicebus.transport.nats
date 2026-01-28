@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <!-- Suppress nullable warnings from NServiceBus.TransportTests.Sources package -->
+    <NoWarn>$(NoWarn);CS8600;CS8601;CS8602;CS8604;CS8614;CS8618;CS8625;CS8767</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Community.NServiceBus.Transport.Nats\Community.NServiceBus.Transport.Nats.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.0.1" />
+    <PackageReference Include="NUnit" Version="4.4.0" />
+    <PackageReference Include="NUnit.Analyzers" Version="4.11.2" />
+    <PackageReference Include="NUnit3TestAdapter" Version="6.1.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="NServiceBus.TransportTests.Sources" Version="10.0.0" />
+  </ItemGroup>
+
+</Project>

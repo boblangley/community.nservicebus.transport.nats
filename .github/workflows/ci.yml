@@ -1,0 +1,73 @@
+name: CI
+on:
+  push:
+    branches:
+      - main
+      - release-*
+  pull_request:
+  workflow_dispatch:
+env:
+  DOTNET_NOLOGO: true
+defaults:
+  run:
+    shell: pwsh
+jobs:
+  build:
+    name: Build
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - name: Build
+        run: dotnet build src/Community.NServiceBus.Transport.Nats --configuration Release
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuget-packages
+          path: nugets/
+          retention-days: 7
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - name: Start NATS with JetStream
+        run: |
+          docker run -d --name nats -p 4222:4222 -p 8222:8222 nats:2.10-alpine --jetstream -m 8222
+          $timeout = 30
+          for ($i = 0; $i -lt $timeout; $i++) {
+            try {
+              $response = Invoke-WebRequest -Uri "http://localhost:8222/healthz" -UseBasicParsing -ErrorAction SilentlyContinue
+              if ($response.StatusCode -eq 200) {
+                Write-Host "NATS is ready"
+                break
+              }
+            } catch {
+              Write-Host "Waiting for NATS..."
+              Start-Sleep -Seconds 1
+            }
+          }
+      - name: Build
+        run: dotnet build src/Community.NServiceBus.Transport.Nats --configuration Release
+      - name: Run Transport Tests
+        run: dotnet test src/Community.NServiceBus.Transport.Nats.TransportTests --configuration Release --no-build --verbosity normal
+        env:
+          NATS_CONNECTION_STRING: nats://localhost:4222
+      - name: Run Acceptance Tests
+        run: dotnet test src/Community.NServiceBus.Transport.Nats.AcceptanceTests --configuration Release --no-build --verbosity normal
+        env:
+          NATS_CONNECTION_STRING: nats://localhost:4222

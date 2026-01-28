@@ -1,0 +1,9 @@
+<Project>
+
+  <!-- Output NuGet packages to the nugets folder at the repo root -->
+  <PropertyGroup>
+    <PackageOutputPath>$(MSBuildThisFileDirectory)..\nugets</PackageOutputPath>
+    <GeneratePackageOnBuild Condition="'$(Configuration)' == 'Release'">true</GeneratePackageOnBuild>
+  </PropertyGroup>
+
+</Project>

@@ -1,0 +1,69 @@
+name: Release
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+-*'
+env:
+  DOTNET_NOLOGO: true
+defaults:
+  run:
+    shell: pwsh
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Start NATS with JetStream
+        run: |
+          docker run -d --name nats -p 4222:4222 -p 8222:8222 nats:2.10-alpine --jetstream -m 8222
+          $timeout = 30
+          for ($i = 0; $i -lt $timeout; $i++) {
+            try {
+              $response = Invoke-WebRequest -Uri "http://localhost:8222/healthz" -UseBasicParsing -ErrorAction SilentlyContinue
+              if ($response.StatusCode -eq 200) {
+                Write-Host "NATS is ready"
+                break
+              }
+            } catch {
+              Write-Host "Waiting for NATS..."
+              Start-Sleep -Seconds 1
+            }
+          }
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - name: Extract version from tag
+        id: version
+        run: |
+          $version = "${{ github.ref_name }}"
+          Write-Host "Version: $version"
+          echo "VERSION=$version" >> $env:GITHUB_OUTPUT
+      - name: Build
+        run: dotnet build src/Community.NServiceBus.Transport.Nats --configuration Release -p:Version=${{ steps.version.outputs.VERSION }}
+      - name: Run Transport Tests
+        run: dotnet test src/Community.NServiceBus.Transport.Nats.TransportTests --configuration Release --no-build --verbosity normal
+        env:
+          NATS_CONNECTION_STRING: nats://localhost:4222
+      - name: Run Acceptance Tests
+        run: dotnet test src/Community.NServiceBus.Transport.Nats.AcceptanceTests --configuration Release --no-build --verbosity normal
+        env:
+          NATS_CONNECTION_STRING: nats://localhost:4222
+      - name: Publish artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nugets
+          path: nugets/*
+          retention-days: 30
+      - name: Push to NuGet
+        run: dotnet nuget push nugets/*.nupkg --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: nugets/*
+          generate_release_notes: true

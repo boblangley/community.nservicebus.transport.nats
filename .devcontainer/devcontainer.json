@@ -1,0 +1,36 @@
+{
+	"name": "Community.NServiceBus.Transport.NATS",
+    "dockerComposeFile": "docker-compose.yml",
+    "service": "devcontainer",
+    "workspaceFolder": "/workspace/community.nservicebus.transport.nats",
+
+	"features": {
+		"ghcr.io/devcontainers-extra/features/uv:1": {},
+		"ghcr.io/devcontainers/features/docker-in-docker:2": {}
+	},
+
+	"customizations": {
+		"vscode": {
+			"settings": {},
+			"extensions": [
+				"streetsidesoftware.code-spell-checker",
+                "ms-dotnettools.csdevkit",
+                "ms-dotnettools.csharp",
+                "github.vscode-github-actions",
+                "ms-azuretools.vscode-containers",
+                "GitHub.vscode-pull-request-github",
+				"anthropic.claude-code"
+			]
+		}
+	},
+
+	"postCreateCommand": {
+		"claude-code": "curl -fsSL https://claude.ai/install.sh | bash",
+		"dotnet-restore": "dotnet restore src/",
+		"nats-cli": "curl -L https://github.com/nats-io/natscli/releases/download/v0.1.5/nats-0.1.5-linux-amd64.zip -o nats.zip && unzip nats.zip && sudo mv nats-0.1.5-linux-amd64/nats /usr/local/bin/ && rm -rf nats.zip nats-0.1.5-linux-amd64"
+	},
+
+	"containerEnv": {
+		"NATS_URL": "nats://nats:4222"
+	}
+}

@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Suppress warnings from NServiceBus.AcceptanceTests.Sources package -->
+    <NoWarn>$(NoWarn);CS8600;CS8601;CS8602;CS8603;CS8604;CS8614;CS8618;CS8622;CS8625;CS8767;NSB0002</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Community.NServiceBus.Transport.Nats\Community.NServiceBus.Transport.Nats.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.0.1" />
+    <PackageReference Include="NUnit" Version="4.4.0" />
+    <PackageReference Include="NUnit.Analyzers" Version="4.11.2" />
+    <PackageReference Include="NUnit3TestAdapter" Version="6.1.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="NServiceBus.AcceptanceTests.Sources" Version="10.0.0" GeneratePathProperty="true" />
+  </ItemGroup>
+
+  <!-- Exclude tests that require features we don't support -->
+  <ItemGroup>
+    <!-- We don't support TransactionScope or SendsAtomicWithReceive -->
+    <Compile Remove="$(PkgNServiceBus_AcceptanceTests_Sources)\**\Tx\**\*.cs" Condition="'$(PkgNServiceBus_AcceptanceTests_Sources)' != ''" />
+    <!-- We don't support DTC (Distributed Transaction Coordinator) -->
+    <Compile Remove="$(PkgNServiceBus_AcceptanceTests_Sources)\**\*dtc*.cs" Condition="'$(PkgNServiceBus_AcceptanceTests_Sources)' != ''" />
+    <Compile Remove="$(PkgNServiceBus_AcceptanceTests_Sources)\**\*_using_dtc*.cs" Condition="'$(PkgNServiceBus_AcceptanceTests_Sources)' != ''" />
+  </ItemGroup>
+
+</Project>
