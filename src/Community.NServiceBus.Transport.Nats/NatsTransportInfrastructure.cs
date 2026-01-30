@@ -8,7 +8,6 @@ sealed class NatsTransportInfrastructure : TransportInfrastructure
 {
     readonly NatsConnectionManager connectionManager;
     readonly TopologyManager topologyManager;
-    readonly DelayedDeliveryProcessor delayedDeliveryProcessor;
     readonly string streamPrefix;
     readonly List<MessagePump> messagePumps = [];
 
@@ -26,8 +25,6 @@ sealed class NatsTransportInfrastructure : TransportInfrastructure
         this.topologyManager = topologyManager;
         this.streamPrefix = streamPrefix;
 
-        delayedDeliveryProcessor = new DelayedDeliveryProcessor(jetStream, topologyManager);
-
         Receivers = receivers.ToDictionary(
             r => r.Id,
             r =>
@@ -36,7 +33,6 @@ sealed class NatsTransportInfrastructure : TransportInfrastructure
                     r.Id,
                     ToTransportAddress(r.ReceiveAddress),
                     topologyManager,
-                    jetStream,
                     criticalErrorAction,
                     circuitBreakerTimeout,
                     loggerFactory);
@@ -52,16 +48,14 @@ sealed class NatsTransportInfrastructure : TransportInfrastructure
         string[] sendingAddresses,
         CancellationToken cancellationToken = default)
     {
-        // Create the events stream for pub/sub
+        // Create events stream with Interest retention
+        // This catch-all stream ensures event publishes always succeed
+        // Messages are immediately deleted if no consumer is interested (no unbounded growth)
         await topologyManager.CreateEventsInfrastructure(cancellationToken);
 
-        // Create delayed delivery infrastructure
-        await topologyManager.CreateDelayedDeliveryInfrastructure(cancellationToken);
-
-        // Start the delayed delivery processor
-        await delayedDeliveryProcessor.Start(cancellationToken);
-
         // Create streams and consumers for each receiver
+        // Each endpoint stream captures unicast messages and schedule subjects
+        // AllowMsgSchedules is enabled for native delayed delivery (NATS 2.12+, ADR-51)
         foreach (var receiver in receivers)
         {
             var address = ToTransportAddress(receiver.ReceiveAddress);
@@ -86,9 +80,6 @@ sealed class NatsTransportInfrastructure : TransportInfrastructure
 
     public override async Task Shutdown(CancellationToken cancellationToken = default)
     {
-        await delayedDeliveryProcessor.Stop(cancellationToken);
-        delayedDeliveryProcessor.Dispose();
-
         foreach (var pump in messagePumps)
         {
             pump.Dispose();

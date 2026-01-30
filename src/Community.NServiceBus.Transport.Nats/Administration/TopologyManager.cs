@@ -24,16 +24,24 @@ sealed class TopologyManager
         CancellationToken cancellationToken = default)
     {
         var streamName = GetStreamName(endpointName);
-        var subject = GetEndpointSubject(endpointName);
+        var unicastSubject = GetEndpointSubject(endpointName);
+        var scheduleSubjectWildcard = GetScheduleSubjectWildcard(endpointName);
 
-        var streamConfig = new StreamConfig(streamName, [subject])
+        // Endpoint stream captures unicast messages and schedule subjects
+        // Events are handled separately via the events stream
+        // Schedule subjects are used for native delayed delivery (NATS 2.12+, ADR-51)
+        var streamConfig = new StreamConfig(streamName, [unicastSubject, scheduleSubjectWildcard])
         {
+            // WorkQueue retention: messages are deleted after being acknowledged
             Retention = StreamConfigRetention.Workqueue,
             Storage = StreamConfigStorage.File,
             MaxMsgs = -1,
             MaxBytes = -1,
-            MaxAge = TimeSpan.Zero,
-            DuplicateWindow = TimeSpan.FromMinutes(2)
+            MaxAge = TimeSpan.Zero, // No age limit - business events should not be lost
+            DuplicateWindow = TimeSpan.FromMinutes(2),
+            // Enable native message scheduling (NATS 2.12+, ADR-51)
+            // Required for delayed delivery - NATS holds the message and delivers at scheduled time
+            AllowMsgSchedules = true
         };
 
         try
@@ -42,18 +50,17 @@ sealed class TopologyManager
         }
         catch (NatsJSApiException ex) when (ex.Error.Code == 400 && ex.Error.Description?.Contains("already exists") == true)
         {
-            // Stream already exists, try to update
             await jetStream.UpdateStreamAsync(streamConfig, cancellationToken);
         }
 
+        // Consumer receives unicast messages only (schedule subjects are for triggering delivery)
         var consumerConfig = new ConsumerConfig(GetConsumerName(endpointName))
         {
             DurableName = GetConsumerName(endpointName),
             AckPolicy = ConsumerConfigAckPolicy.Explicit,
             AckWait = TimeSpan.FromSeconds(30),
-            // MaxDeliver = -1 means unlimited deliveries - let NServiceBus control retry behavior
             MaxDeliver = -1,
-            FilterSubject = subject
+            FilterSubject = unicastSubject
         };
 
         try
@@ -62,7 +69,6 @@ sealed class TopologyManager
         }
         catch (NatsJSApiException ex) when (ex.Error.Code == 400)
         {
-            // Consumer exists, update it
             await jetStream.CreateOrUpdateConsumerAsync(streamName, consumerConfig, cancellationToken);
         }
     }
@@ -82,16 +88,18 @@ sealed class TopologyManager
     public async Task EnsureEndpointStreamExists(string endpointName, CancellationToken cancellationToken = default)
     {
         var streamName = GetStreamName(endpointName);
-        var subject = GetEndpointSubject(endpointName);
+        var unicastSubject = GetEndpointSubject(endpointName);
+        var scheduleSubjectWildcard = GetScheduleSubjectWildcard(endpointName);
 
-        var streamConfig = new StreamConfig(streamName, [subject])
+        var streamConfig = new StreamConfig(streamName, [unicastSubject, scheduleSubjectWildcard])
         {
             Retention = StreamConfigRetention.Workqueue,
             Storage = StreamConfigStorage.File,
             MaxMsgs = -1,
             MaxBytes = -1,
             MaxAge = TimeSpan.Zero,
-            DuplicateWindow = TimeSpan.FromMinutes(2)
+            DuplicateWindow = TimeSpan.FromMinutes(2),
+            AllowMsgSchedules = true
         };
 
         try
@@ -101,33 +109,6 @@ sealed class TopologyManager
         catch (NatsJSApiException ex) when (ex.Error.Code == 400 && ex.Error.Description?.Contains("already exists") == true)
         {
             // Stream already exists, that's fine
-        }
-    }
-
-    public async Task CreateEventsInfrastructure(CancellationToken cancellationToken = default)
-    {
-        var streamName = GetEventsStreamName();
-        var subject = $"{streamPrefix}.events.>";
-
-        // Use Limits retention instead of Interest - Interest requires active consumers
-        // and has stricter timing requirements
-        var streamConfig = new StreamConfig(streamName, [subject])
-        {
-            Retention = StreamConfigRetention.Limits,
-            Storage = StreamConfigStorage.File,
-            MaxMsgs = 10000,
-            MaxBytes = -1,
-            MaxAge = TimeSpan.FromHours(1),
-            DuplicateWindow = TimeSpan.FromMinutes(2)
-        };
-
-        try
-        {
-            await jetStream.CreateStreamAsync(streamConfig, cancellationToken);
-        }
-        catch (NatsJSApiException ex) when (ex.Error.Code == 400 && ex.Error.Description?.Contains("already exists") == true)
-        {
-            await jetStream.UpdateStreamAsync(streamConfig, cancellationToken);
         }
     }
 
@@ -144,6 +125,7 @@ sealed class TopologyManager
                 return; // Already subscribed
             }
 
+            // Create/update consumer on events stream with filtered subjects
             await UpdateEventsConsumer(endpointName, subscriptions, cancellationToken);
         }
         finally
@@ -168,6 +150,7 @@ sealed class TopologyManager
                 return; // Not subscribed
             }
 
+            // Update consumer on events stream
             await UpdateEventsConsumer(endpointName, subscriptions, cancellationToken);
         }
         finally
@@ -200,7 +183,6 @@ sealed class TopologyManager
             DurableName = consumerName,
             AckPolicy = ConsumerConfigAckPolicy.Explicit,
             AckWait = TimeSpan.FromSeconds(30),
-            // MaxDeliver = -1 means unlimited deliveries - let NServiceBus control retry behavior
             MaxDeliver = -1,
             FilterSubjects = [.. subscriptions]
         };
@@ -237,14 +219,22 @@ sealed class TopologyManager
 
     public string GetConsumerName(string endpointName) => $"{SanitizeName(endpointName)}-main";
 
-    public async Task CreateDelayedDeliveryInfrastructure(CancellationToken cancellationToken = default)
+    /// <summary>
+    /// Creates the events stream infrastructure for pub/sub.
+    /// This catch-all stream ensures event publishes always succeed, even if no subscribers exist.
+    /// Uses Interest retention: messages are deleted when all consumers ACK (no unbounded growth).
+    /// </summary>
+    public async Task CreateEventsInfrastructure(CancellationToken cancellationToken = default)
     {
-        var streamName = GetDelayedStreamName();
-        var subject = $"{streamPrefix}.delayed.>";
+        var streamName = GetEventsStreamName();
+        var subject = $"{streamPrefix}.events.>";
 
         var streamConfig = new StreamConfig(streamName, [subject])
         {
-            Retention = StreamConfigRetention.Workqueue,
+            // Interest retention: messages are deleted when all consumers have ACKed
+            // If no consumers exist for a subject, the message is immediately deleted
+            // This prevents unbounded growth while ensuring publishes always succeed
+            Retention = StreamConfigRetention.Interest,
             Storage = StreamConfigStorage.File,
             MaxMsgs = -1,
             MaxBytes = -1,
@@ -260,24 +250,6 @@ sealed class TopologyManager
         {
             await jetStream.UpdateStreamAsync(streamConfig, cancellationToken);
         }
-
-        // Create a consumer for processing delayed messages
-        var consumerConfig = new ConsumerConfig(GetDelayedConsumerName())
-        {
-            DurableName = GetDelayedConsumerName(),
-            AckPolicy = ConsumerConfigAckPolicy.Explicit,
-            AckWait = TimeSpan.FromSeconds(30),
-            MaxDeliver = 10
-        };
-
-        await jetStream.CreateOrUpdateConsumerAsync(streamName, consumerConfig, cancellationToken);
-    }
-
-    public async Task<INatsJSConsumer> GetDelayedConsumer(CancellationToken cancellationToken = default)
-    {
-        var streamName = GetDelayedStreamName();
-        var consumerName = GetDelayedConsumerName();
-        return await jetStream.GetConsumerAsync(streamName, consumerName, cancellationToken);
     }
 
     public string GetEventsStreamName() => $"{streamPrefix}-events";
@@ -293,11 +265,19 @@ sealed class TopologyManager
     /// </summary>
     static string SanitizeEventType(string eventType) => eventType.Replace("+", "--").Replace(".", "-");
 
-    public string GetDelayedStreamName() => $"{streamPrefix}-delayed";
+    /// <summary>
+    /// Gets the schedule subject for a specific message to a specific endpoint.
+    /// Each scheduled message needs a unique subject within the endpoint's stream.
+    /// The target subject (endpoint subject) must be in the same stream for ADR-51.
+    /// </summary>
+    public string GetScheduleSubject(string endpointName, string messageId) =>
+        $"{streamPrefix}.schedule.{SanitizeName(endpointName)}.{SanitizeName(messageId)}";
 
-    public string GetDelayedConsumerName() => "delayed-processor";
-
-    public string GetDelayedSubject(string destination) => $"{streamPrefix}.delayed.{SanitizeName(destination)}";
+    /// <summary>
+    /// Gets the wildcard subject pattern for capturing all schedule subjects for an endpoint.
+    /// </summary>
+    string GetScheduleSubjectWildcard(string endpointName) =>
+        $"{streamPrefix}.schedule.{SanitizeName(endpointName)}.>";
 
     static string SanitizeName(string name) => name.ToLowerInvariant().Replace(".", "-");
 }
