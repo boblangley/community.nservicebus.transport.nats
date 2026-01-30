@@ -52,11 +52,60 @@ sealed class NatsConnectionManager : IAsyncDisposable
 
     public NatsConnectionState ConnectionState => connection.ConnectionState;
 
+
     public async ValueTask ConnectAsync(CancellationToken cancellationToken = default)
     {
         logger.LogInformation("Connecting to NATS server...");
         await connection.ConnectAsync().AsTask().WaitAsync(cancellationToken);
         logger.LogInformation("Connected to NATS server at {ServerInfo}", connection.ServerInfo?.Name ?? "unknown");
+
+        EnsureMinimumServerVersion();
+    }
+
+    void EnsureMinimumServerVersion()
+    {
+        var serverInfo = connection.ServerInfo;
+        if (serverInfo == null)
+        {
+            throw new InvalidOperationException(
+                "Unable to determine NATS server version. The NServiceBus NATS transport requires NATS server 2.12 or later for native scheduled message delivery support.");
+        }
+
+        var versionString = serverInfo.Version;
+        if (string.IsNullOrEmpty(versionString))
+        {
+            throw new InvalidOperationException(
+                "Unable to determine NATS server version. The NServiceBus NATS transport requires NATS server 2.12 or later for native scheduled message delivery support.");
+        }
+
+        // Parse version string (e.g., "2.12.0", "2.12.0-beta.1")
+        var versionPart = versionString.Split('-')[0]; // Remove pre-release suffix
+        var parts = versionPart.Split('.');
+
+        if (parts.Length < 2 ||
+            !int.TryParse(parts[0], out var major) ||
+            !int.TryParse(parts[1], out var minor))
+        {
+            throw new InvalidOperationException(
+                $"Unable to parse NATS server version '{versionString}'. The NServiceBus NATS transport requires NATS server 2.12 or later for native scheduled message delivery support.");
+        }
+
+        const int requiredMajor = 2;
+        const int requiredMinor = 12;
+
+        if (major < requiredMajor || (major == requiredMajor && minor < requiredMinor))
+        {
+            throw new InvalidOperationException(
+                $"NATS server version {versionString} is not supported. The NServiceBus NATS transport requires NATS server {requiredMajor}.{requiredMinor} or later for native scheduled message delivery support. " +
+                $"Please upgrade your NATS server to version {requiredMajor}.{requiredMinor} or later.");
+        }
+
+        logger.LogInformation(
+            "NATS server version {Version} meets minimum requirement ({Required}+). Server: {ServerName}, Cluster: {ClusterName}",
+            versionString,
+            $"{requiredMajor}.{requiredMinor}",
+            serverInfo.Name ?? "unknown",
+            serverInfo.Cluster ?? "unknown");
     }
 
     ValueTask OnConnectionDisconnected(object? sender, NatsEventArgs args)

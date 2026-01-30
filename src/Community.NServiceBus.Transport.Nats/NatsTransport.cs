@@ -71,9 +71,32 @@ public sealed class NatsTransport : TransportDefinition
             await infrastructure.SetupInfrastructure(receivers, sendingAddresses, cancellationToken);
         }
 
+        WriteStartupDiagnostics(hostSettings, connectionManager);
+
         return infrastructure;
     }
 
     public override IReadOnlyCollection<TransportTransactionMode> GetSupportedTransactionModes() =>
         [TransportTransactionMode.None, TransportTransactionMode.ReceiveOnly];
+
+    void WriteStartupDiagnostics(HostSettings hostSettings, NatsConnectionManager connectionManager)
+    {
+        var serverInfo = connectionManager.Connection.ServerInfo;
+
+        hostSettings.StartupDiagnostic.Add("NServiceBus.Transport.Nats", new
+        {
+            StreamPrefix,
+            ServerVersion = serverInfo?.Version ?? "unknown",
+            ServerName = serverInfo?.Name ?? "unknown",
+            Cluster = serverInfo?.Cluster ?? "none",
+            JetStreamEnabled = true, // Required for this transport
+            MaxDeliveryAttempts,
+            AckWait = AckWait.ToString(),
+            PrefetchCount,
+            EnableMessageDeduplication,
+            DeduplicationWindow = DeduplicationWindow.ToString(),
+            TimeToWaitBeforeTriggeringCircuitBreaker = TimeToWaitBeforeTriggeringCircuitBreaker.ToString(),
+            DelayedDelivery = "Native (NATS 2.12+ scheduled messages)"
+        });
+    }
 }
