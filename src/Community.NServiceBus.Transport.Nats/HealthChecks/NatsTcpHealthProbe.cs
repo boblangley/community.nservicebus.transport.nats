@@ -126,7 +126,6 @@ public sealed class NatsTcpHealthProbe : IHostedService, IDisposable
     /// <inheritdoc />
     public void Dispose()
     {
-        cts.Cancel();
         cts.Dispose();
         listener?.Stop();
     }
