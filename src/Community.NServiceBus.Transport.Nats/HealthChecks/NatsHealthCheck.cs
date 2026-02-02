@@ -4,21 +4,22 @@ using Microsoft.Extensions.Diagnostics.HealthChecks;
 using NATS.Client.Core;
 
 /// <summary>
-/// Health check for NATS connection status
+/// Health check for NATS transport connection status.
+/// Integrates with ASP.NET Core health check infrastructure.
 /// </summary>
 public sealed class NatsHealthCheck : IHealthCheck
 {
-    readonly NatsConnection connection;
+    readonly NatsTransport transport;
     readonly string name;
 
     /// <summary>
     /// Creates a new NATS health check
     /// </summary>
-    /// <param name="connection">The NATS connection to check</param>
+    /// <param name="transport">The NATS transport to check</param>
     /// <param name="name">Optional name for the health check</param>
-    public NatsHealthCheck(NatsConnection connection, string? name = null)
+    public NatsHealthCheck(NatsTransport transport, string? name = null)
     {
-        this.connection = connection ?? throw new ArgumentNullException(nameof(connection));
+        this.transport = transport ?? throw new ArgumentNullException(nameof(transport));
         this.name = name ?? "nats";
     }
 
@@ -27,12 +28,12 @@ public sealed class NatsHealthCheck : IHealthCheck
         HealthCheckContext context,
         CancellationToken cancellationToken = default)
     {
-        var state = connection.ConnectionState;
+        var state = transport.GetConnectionState();
 
         return Task.FromResult(state switch
         {
             NatsConnectionState.Open => HealthCheckResult.Healthy(
-                $"NATS connection '{name}' is open. Server: {connection.ServerInfo?.Name ?? "unknown"}"),
+                $"NATS connection '{name}' is open. Server: {transport.ServerName ?? "unknown"}"),
 
             NatsConnectionState.Connecting => HealthCheckResult.Degraded(
                 $"NATS connection '{name}' is connecting..."),

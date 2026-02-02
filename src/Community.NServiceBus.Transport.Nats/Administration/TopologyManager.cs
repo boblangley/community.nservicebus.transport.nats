@@ -8,31 +8,37 @@ sealed class TopologyManager
 {
     readonly NatsJSContext jetStream;
     readonly string streamPrefix;
+    readonly TimeSpan ackWait;
     readonly ConcurrentDictionary<string, HashSet<string>> endpointSubscriptions = new();
     readonly SemaphoreSlim subscriptionLock = new(1, 1);
 
-    public TopologyManager(NatsJSContext jetStream, string streamPrefix)
+    public TopologyManager(NatsJSContext jetStream, string streamPrefix, TimeSpan ackWait)
     {
         this.jetStream = jetStream;
         this.streamPrefix = streamPrefix;
+        this.ackWait = ackWait;
     }
 
     public string StreamPrefix => streamPrefix;
 
-    public async Task CreateEndpointInfrastructure(
-        string endpointName,
-        CancellationToken cancellationToken = default)
+    /// <summary>
+    /// Creates the central events stream that captures all published events.
+    /// Endpoint streams source from this stream with filters for their subscribed event types.
+    /// </summary>
+    public async Task CreateEventsStream(CancellationToken cancellationToken = default)
     {
-        var streamName = GetStreamName(endpointName);
-        var subject = GetEndpointSubject(endpointName);
+        var streamName = GetEventsStreamName();
 
-        var streamConfig = new StreamConfig(streamName, [subject])
+        var streamConfig = new StreamConfig(streamName, [GetEventsSubjectWildcard()])
         {
-            Retention = StreamConfigRetention.Workqueue,
+            // Limits retention - messages stay until max_age or max_msgs
+            // Sourcing copies messages to endpoint streams, so this is just a router
+            Retention = StreamConfigRetention.Limits,
             Storage = StreamConfigStorage.File,
             MaxMsgs = -1,
             MaxBytes = -1,
-            MaxAge = TimeSpan.Zero,
+            // Aggressive cleanup - messages only need to exist long enough for sourcing
+            MaxAge = TimeSpan.FromHours(1),
             DuplicateWindow = TimeSpan.FromMinutes(2)
         };
 
@@ -42,27 +48,134 @@ sealed class TopologyManager
         }
         catch (NatsJSApiException ex) when (ex.Error.Code == 400 && ex.Error.Description?.Contains("already exists") == true)
         {
-            // Stream already exists, try to update
+            // Stream already exists, update it to ensure config is current
             await jetStream.UpdateStreamAsync(streamConfig, cancellationToken);
         }
+    }
 
-        var consumerConfig = new ConsumerConfig(GetConsumerName(endpointName))
+    /// <summary>
+    /// Creates the central delayed stream that handles native NATS scheduling.
+    /// Messages are published here with Nats-Schedule headers, then delivered to ready subjects
+    /// which are sourced by endpoint streams.
+    /// </summary>
+    public async Task CreateDelayedStream(CancellationToken cancellationToken = default)
+    {
+        var streamName = GetDelayedStreamName();
+
+        var streamConfig = new StreamConfig(streamName, [
+            GetDelayedSubjectWildcard(),
+            GetReadySubjectWildcard()
+        ])
         {
-            DurableName = GetConsumerName(endpointName),
-            AckPolicy = ConsumerConfigAckPolicy.Explicit,
-            AckWait = TimeSpan.FromSeconds(30),
-            // MaxDeliver = -1 means unlimited deliveries - let NServiceBus control retry behavior
-            MaxDeliver = -1,
-            FilterSubject = subject
+            // Limits retention - scheduled messages are purged after delivery
+            Retention = StreamConfigRetention.Limits,
+            Storage = StreamConfigStorage.File,
+            MaxMsgs = -1,
+            MaxBytes = -1,
+            // Keep ready messages long enough for sourcing to pick them up
+            MaxAge = TimeSpan.FromHours(1),
+            DuplicateWindow = TimeSpan.FromMinutes(2),
+            // Enable native message scheduling (NATS 2.12+, ADR-51)
+            AllowMsgSchedules = true
         };
 
         try
         {
-            await jetStream.CreateOrUpdateConsumerAsync(streamName, consumerConfig, cancellationToken);
+            await jetStream.CreateStreamAsync(streamConfig, cancellationToken);
         }
-        catch (NatsJSApiException ex) when (ex.Error.Code == 400)
+        catch (NatsJSApiException ex) when (ex.Error.Code == 400 && ex.Error.Description?.Contains("already exists") == true)
         {
-            // Consumer exists, update it
+            // Stream already exists, update it to ensure config is current
+            await jetStream.UpdateStreamAsync(streamConfig, cancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// Creates endpoint infrastructure: stream for unicast messages with sources from events and delayed streams.
+    /// </summary>
+    public async Task CreateEndpointInfrastructure(
+        string endpointName,
+        CancellationToken cancellationToken = default)
+    {
+        var streamName = GetStreamName(endpointName);
+        var delayedStreamName = GetDelayedStreamName();
+
+        // Endpoint stream captures unicast messages directly.
+        // Events and delayed messages come through sourcing from central streams.
+        // NO AllowMsgSchedules - endpoint streams use Sources which is mutually exclusive.
+        var sources = new List<StreamSource>
+        {
+            // Always source ready messages from the delayed stream for this endpoint
+            new StreamSource
+            {
+                Name = delayedStreamName,
+                FilterSubject = GetReadySubject(endpointName)
+            }
+        };
+
+        var streamConfig = new StreamConfig(streamName, [GetEndpointSubject(endpointName)])
+        {
+            // WorkQueue retention: messages are deleted after being acknowledged
+            Retention = StreamConfigRetention.Workqueue,
+            Storage = StreamConfigStorage.File,
+            MaxMsgs = -1,
+            MaxBytes = -1,
+            MaxAge = TimeSpan.Zero, // No age limit - business messages should not be lost
+            DuplicateWindow = TimeSpan.FromMinutes(2),
+            // Explicitly disable - endpoint streams use Sources which is mutually exclusive with AllowMsgSchedules
+            AllowMsgSchedules = false,
+            Sources = sources
+        };
+
+        try
+        {
+            await jetStream.CreateStreamAsync(streamConfig, cancellationToken);
+        }
+        catch (NatsJSApiException ex) when (ex.Error.Code == 400 && ex.Error.Description?.Contains("already exists") == true)
+        {
+            // Stream exists - read current config to preserve event sources, then update
+            var existingStream = await jetStream.GetStreamAsync(streamName, cancellationToken: cancellationToken);
+
+            // Merge existing event sources with the delayed source
+            var existingSources = existingStream.Info.Config.Sources ?? [];
+            var mergedSources = new List<StreamSource>(sources);
+            foreach (var source in existingSources)
+            {
+                // Keep event sources, skip if it's a duplicate delayed source
+                if (source.Name != delayedStreamName)
+                {
+                    mergedSources.Add(source);
+                }
+            }
+            // When updating, explicitly disable AllowMsgSchedules (may have been enabled in older versions)
+            streamConfig = streamConfig with { Sources = mergedSources, AllowMsgSchedules = false };
+            await jetStream.UpdateStreamAsync(streamConfig, cancellationToken);
+        }
+
+        // Consumer receives all messages from the endpoint stream
+        var consumerName = GetConsumerName(endpointName);
+        var consumerConfig = new ConsumerConfig(consumerName)
+        {
+            DurableName = consumerName,
+            AckPolicy = ConsumerConfigAckPolicy.Explicit,
+            AckWait = ackWait,
+            MaxDeliver = -1,
+            // Filter to unicast, ready (delayed), and event subjects
+            // Sourced messages retain their original subjects
+            FilterSubjects = [
+                GetEndpointSubject(endpointName),
+                GetReadySubject(endpointName), // Sourced delayed messages
+                GetEventsSubjectWildcard() // Sourced events retain their original subject
+            ]
+        };
+
+        try
+        {
+            await jetStream.CreateConsumerAsync(streamName, consumerConfig, cancellationToken);
+        }
+        catch (NatsJSApiException ex) when (ex.Error.Code == 400 && ex.Error.Description?.Contains("already exists") == true)
+        {
+            // Consumer exists - update it
             await jetStream.CreateOrUpdateConsumerAsync(streamName, consumerConfig, cancellationToken);
         }
     }
@@ -82,16 +195,29 @@ sealed class TopologyManager
     public async Task EnsureEndpointStreamExists(string endpointName, CancellationToken cancellationToken = default)
     {
         var streamName = GetStreamName(endpointName);
-        var subject = GetEndpointSubject(endpointName);
+        var delayedStreamName = GetDelayedStreamName();
 
-        var streamConfig = new StreamConfig(streamName, [subject])
+        // Source ready messages from the delayed stream
+        var sources = new List<StreamSource>
+        {
+            new StreamSource
+            {
+                Name = delayedStreamName,
+                FilterSubject = GetReadySubject(endpointName)
+            }
+        };
+
+        var streamConfig = new StreamConfig(streamName, [GetEndpointSubject(endpointName)])
         {
             Retention = StreamConfigRetention.Workqueue,
             Storage = StreamConfigStorage.File,
             MaxMsgs = -1,
             MaxBytes = -1,
             MaxAge = TimeSpan.Zero,
-            DuplicateWindow = TimeSpan.FromMinutes(2)
+            DuplicateWindow = TimeSpan.FromMinutes(2),
+            // Explicitly disable - endpoint streams use Sources which is mutually exclusive with AllowMsgSchedules
+            AllowMsgSchedules = false,
+            Sources = sources
         };
 
         try
@@ -104,33 +230,10 @@ sealed class TopologyManager
         }
     }
 
-    public async Task CreateEventsInfrastructure(CancellationToken cancellationToken = default)
-    {
-        var streamName = GetEventsStreamName();
-        var subject = $"{streamPrefix}.events.>";
-
-        // Use Limits retention instead of Interest - Interest requires active consumers
-        // and has stricter timing requirements
-        var streamConfig = new StreamConfig(streamName, [subject])
-        {
-            Retention = StreamConfigRetention.Limits,
-            Storage = StreamConfigStorage.File,
-            MaxMsgs = 10000,
-            MaxBytes = -1,
-            MaxAge = TimeSpan.FromHours(1),
-            DuplicateWindow = TimeSpan.FromMinutes(2)
-        };
-
-        try
-        {
-            await jetStream.CreateStreamAsync(streamConfig, cancellationToken);
-        }
-        catch (NatsJSApiException ex) when (ex.Error.Code == 400 && ex.Error.Description?.Contains("already exists") == true)
-        {
-            await jetStream.UpdateStreamAsync(streamConfig, cancellationToken);
-        }
-    }
-
+    /// <summary>
+    /// Subscribes an endpoint to an event type by adding a source filter from the events stream.
+    /// The endpoint stream will source messages matching the filter from the central events stream.
+    /// </summary>
     public async Task SubscribeToEvent(string endpointName, string eventType, CancellationToken cancellationToken = default)
     {
         await subscriptionLock.WaitAsync(cancellationToken);
@@ -141,10 +244,10 @@ sealed class TopologyManager
 
             if (!subscriptions.Add(eventSubject))
             {
-                return; // Already subscribed
+                return; // Already subscribed locally
             }
 
-            await UpdateEventsConsumer(endpointName, subscriptions, cancellationToken);
+            await UpdateStreamSources(endpointName, cancellationToken);
         }
         finally
         {
@@ -152,6 +255,9 @@ sealed class TopologyManager
         }
     }
 
+    /// <summary>
+    /// Unsubscribes an endpoint from an event type by removing the source filter.
+    /// </summary>
     public async Task UnsubscribeFromEvent(string endpointName, string eventType, CancellationToken cancellationToken = default)
     {
         await subscriptionLock.WaitAsync(cancellationToken);
@@ -165,10 +271,10 @@ sealed class TopologyManager
             var eventSubject = GetEventSubject(eventType);
             if (!subscriptions.Remove(eventSubject))
             {
-                return; // Not subscribed
+                return; // Not subscribed locally
             }
 
-            await UpdateEventsConsumer(endpointName, subscriptions, cancellationToken);
+            await UpdateStreamSources(endpointName, cancellationToken);
         }
         finally
         {
@@ -176,60 +282,72 @@ sealed class TopologyManager
         }
     }
 
-    async Task UpdateEventsConsumer(string endpointName, HashSet<string> subscriptions, CancellationToken cancellationToken)
+    /// <summary>
+    /// Updates the endpoint stream's sources to reflect current subscriptions.
+    /// Each subscription becomes a source from the events stream with a filter_subject.
+    /// The delayed stream source is always preserved.
+    /// </summary>
+    async Task UpdateStreamSources(string endpointName, CancellationToken cancellationToken)
     {
-        var streamName = GetEventsStreamName();
-        var consumerName = GetEventsConsumerName(endpointName);
+        var streamName = GetStreamName(endpointName);
+        var eventsStreamName = GetEventsStreamName();
+        var delayedStreamName = GetDelayedStreamName();
 
-        if (subscriptions.Count == 0)
+        // Build sources list - always include the delayed stream source
+        var sources = new List<StreamSource>
         {
-            // No subscriptions - delete consumer if it exists
-            try
+            new StreamSource
             {
-                await jetStream.DeleteConsumerAsync(streamName, consumerName, cancellationToken);
+                Name = delayedStreamName,
+                FilterSubject = GetReadySubject(endpointName)
             }
-            catch (NatsJSApiException ex) when (ex.Error.Code == 404)
+        };
+
+        // Add event sources from current subscriptions
+        if (endpointSubscriptions.TryGetValue(endpointName, out var subscriptions))
+        {
+            foreach (var eventSubject in subscriptions)
             {
-                // Consumer doesn't exist
+                sources.Add(new StreamSource
+                {
+                    Name = eventsStreamName,
+                    FilterSubject = eventSubject
+                });
             }
+        }
+
+        // Read existing stream config and update sources
+        INatsJSStream stream;
+        try
+        {
+            stream = await jetStream.GetStreamAsync(streamName, cancellationToken: cancellationToken);
+        }
+        catch (NatsJSApiException)
+        {
+            // Stream doesn't exist yet - will be created when endpoint starts
             return;
         }
 
-        var consumerConfig = new ConsumerConfig(consumerName)
+        var existingConfig = stream.Info.Config;
+        var streamConfig = new StreamConfig(streamName, existingConfig.Subjects ?? [])
         {
-            DurableName = consumerName,
-            AckPolicy = ConsumerConfigAckPolicy.Explicit,
-            AckWait = TimeSpan.FromSeconds(30),
-            // MaxDeliver = -1 means unlimited deliveries - let NServiceBus control retry behavior
-            MaxDeliver = -1,
-            FilterSubjects = [.. subscriptions]
+            Retention = existingConfig.Retention,
+            Storage = existingConfig.Storage,
+            MaxMsgs = existingConfig.MaxMsgs,
+            MaxBytes = existingConfig.MaxBytes,
+            MaxAge = existingConfig.MaxAge,
+            DuplicateWindow = existingConfig.DuplicateWindow,
+            // Explicitly disable AllowMsgSchedules - endpoint streams use Sources which is mutually exclusive
+            AllowMsgSchedules = false,
+            Sources = sources
         };
 
-        await jetStream.CreateOrUpdateConsumerAsync(streamName, consumerConfig, cancellationToken);
+        await jetStream.UpdateStreamAsync(streamConfig, cancellationToken);
     }
 
-    public async Task<INatsJSConsumer?> GetEventsConsumer(string endpointName, CancellationToken cancellationToken = default)
-    {
-        if (!endpointSubscriptions.TryGetValue(endpointName, out var subscriptions) || subscriptions.Count == 0)
-        {
-            return null;
-        }
+    public string GetEventsStreamName() => $"{streamPrefix}-events";
 
-        var streamName = GetEventsStreamName();
-        var consumerName = GetEventsConsumerName(endpointName);
-
-        try
-        {
-            return await jetStream.GetConsumerAsync(streamName, consumerName, cancellationToken);
-        }
-        catch (NatsJSApiException ex) when (ex.Error.Code == 404)
-        {
-            return null;
-        }
-    }
-
-    public bool HasEventSubscriptions(string endpointName) =>
-        endpointSubscriptions.TryGetValue(endpointName, out var subs) && subs.Count > 0;
+    public string GetDelayedStreamName() => $"{streamPrefix}-delayed";
 
     public string GetStreamName(string endpointName) => $"{streamPrefix}-{SanitizeName(endpointName)}";
 
@@ -237,54 +355,37 @@ sealed class TopologyManager
 
     public string GetConsumerName(string endpointName) => $"{SanitizeName(endpointName)}-main";
 
-    public async Task CreateDelayedDeliveryInfrastructure(CancellationToken cancellationToken = default)
-    {
-        var streamName = GetDelayedStreamName();
-        var subject = $"{streamPrefix}.delayed.>";
-
-        var streamConfig = new StreamConfig(streamName, [subject])
-        {
-            Retention = StreamConfigRetention.Workqueue,
-            Storage = StreamConfigStorage.File,
-            MaxMsgs = -1,
-            MaxBytes = -1,
-            MaxAge = TimeSpan.Zero,
-            DuplicateWindow = TimeSpan.FromMinutes(2)
-        };
-
-        try
-        {
-            await jetStream.CreateStreamAsync(streamConfig, cancellationToken);
-        }
-        catch (NatsJSApiException ex) when (ex.Error.Code == 400 && ex.Error.Description?.Contains("already exists") == true)
-        {
-            await jetStream.UpdateStreamAsync(streamConfig, cancellationToken);
-        }
-
-        // Create a consumer for processing delayed messages
-        var consumerConfig = new ConsumerConfig(GetDelayedConsumerName())
-        {
-            DurableName = GetDelayedConsumerName(),
-            AckPolicy = ConsumerConfigAckPolicy.Explicit,
-            AckWait = TimeSpan.FromSeconds(30),
-            MaxDeliver = 10
-        };
-
-        await jetStream.CreateOrUpdateConsumerAsync(streamName, consumerConfig, cancellationToken);
-    }
-
-    public async Task<INatsJSConsumer> GetDelayedConsumer(CancellationToken cancellationToken = default)
-    {
-        var streamName = GetDelayedStreamName();
-        var consumerName = GetDelayedConsumerName();
-        return await jetStream.GetConsumerAsync(streamName, consumerName, cancellationToken);
-    }
-
-    public string GetEventsStreamName() => $"{streamPrefix}-events";
-
-    public string GetEventsConsumerName(string endpointName) => $"{SanitizeName(endpointName)}-events";
-
     public string GetEventSubject(string eventType) => $"{streamPrefix}.events.{SanitizeEventType(eventType)}";
+
+    /// <summary>
+    /// Gets the wildcard subject for all events.
+    /// </summary>
+    string GetEventsSubjectWildcard() => $"{streamPrefix}.events.>";
+
+    /// <summary>
+    /// Gets the delayed subject for a specific scheduled message.
+    /// Messages published here are held by NATS until the scheduled time.
+    /// </summary>
+    public string GetDelayedSubject(string endpointName, string messageId) =>
+        $"{streamPrefix}.delayed.{SanitizeName(endpointName)}.{SanitizeName(messageId)}";
+
+    /// <summary>
+    /// Gets the wildcard subject for all delayed messages.
+    /// </summary>
+    string GetDelayedSubjectWildcard() => $"{streamPrefix}.delayed.>";
+
+    /// <summary>
+    /// Gets the ready subject for an endpoint.
+    /// Scheduled messages are delivered here when their time comes.
+    /// Endpoint streams source from this subject.
+    /// </summary>
+    public string GetReadySubject(string endpointName) =>
+        $"{streamPrefix}.ready.{SanitizeName(endpointName)}";
+
+    /// <summary>
+    /// Gets the wildcard subject for all ready messages.
+    /// </summary>
+    string GetReadySubjectWildcard() => $"{streamPrefix}.ready.>";
 
     /// <summary>
     /// Sanitizes event type names for use in NATS subjects.
@@ -292,12 +393,6 @@ sealed class TopologyManager
     /// Also replaces . with - since . is the subject delimiter.
     /// </summary>
     static string SanitizeEventType(string eventType) => eventType.Replace("+", "--").Replace(".", "-");
-
-    public string GetDelayedStreamName() => $"{streamPrefix}-delayed";
-
-    public string GetDelayedConsumerName() => "delayed-processor";
-
-    public string GetDelayedSubject(string destination) => $"{streamPrefix}.delayed.{SanitizeName(destination)}";
 
     static string SanitizeName(string name) => name.ToLowerInvariant().Replace(".", "-");
 }

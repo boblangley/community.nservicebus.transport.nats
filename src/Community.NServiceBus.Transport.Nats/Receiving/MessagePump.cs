@@ -4,7 +4,6 @@ using System.Text;
 using Microsoft.Extensions.Logging;
 using NATS.Client.Core;
 using NATS.Client.JetStream;
-using NATS.Client.JetStream.Models;
 using NServiceBus.Extensibility;
 using NServiceBus.Transport;
 
@@ -13,7 +12,6 @@ sealed class MessagePump : IMessageReceiver, IDisposable
     readonly string id;
     readonly string receiveAddress;
     readonly TopologyManager topologyManager;
-    readonly NatsJSContext jetStream;
     readonly SubscriptionManager subscriptionManager;
     readonly Action<string, Exception, CancellationToken> criticalErrorAction;
     readonly ConnectionFailedCircuitBreaker circuitBreaker;
@@ -24,16 +22,14 @@ sealed class MessagePump : IMessageReceiver, IDisposable
     SemaphoreSlim? concurrencyLimiter;
     CancellationTokenSource? messageReceivingCancellationTokenSource;
     CancellationTokenSource? messageProcessingCancellationTokenSource;
-    CancellationTokenSource? eventsConsumerCancellationTokenSource;
+    CancellationTokenSource? consumerIterationCancellationTokenSource;
     Task? messageReceivingTask;
-    Task? eventsReceivingTask;
     long messagesBeingProcessed;
 
     public MessagePump(
         string id,
         string receiveAddress,
         TopologyManager topologyManager,
-        NatsJSContext jetStream,
         Action<string, Exception, CancellationToken> criticalErrorAction,
         TimeSpan? circuitBreakerTimeout = null,
         ILoggerFactory? loggerFactory = null)
@@ -41,7 +37,6 @@ sealed class MessagePump : IMessageReceiver, IDisposable
         this.id = id;
         this.receiveAddress = receiveAddress;
         this.topologyManager = topologyManager;
-        this.jetStream = jetStream;
         this.criticalErrorAction = criticalErrorAction;
 
         circuitBreaker = new ConnectionFailedCircuitBreaker(
@@ -50,8 +45,16 @@ sealed class MessagePump : IMessageReceiver, IDisposable
             criticalErrorAction,
             loggerFactory);
 
-        // Create the subscription manager with a callback to this pump
-        this.subscriptionManager = new SubscriptionManager(receiveAddress, topologyManager, OnSubscriptionChanged);
+        // Create the subscription manager with callback to restart consumer when subscriptions change
+        subscriptionManager = new SubscriptionManager(receiveAddress, topologyManager);
+        subscriptionManager.SetSubscriptionChangedCallback(OnSubscriptionChanged);
+    }
+
+    void OnSubscriptionChanged()
+    {
+        // Cancel the current consumer iteration to pick up updated filter subjects
+        // The while loop in ReceiveMessages will restart and re-fetch the consumer
+        consumerIterationCancellationTokenSource?.Cancel();
     }
 
     public ISubscriptionManager Subscriptions => subscriptionManager;
@@ -77,14 +80,11 @@ sealed class MessagePump : IMessageReceiver, IDisposable
     {
         messageReceivingCancellationTokenSource = new CancellationTokenSource();
         messageProcessingCancellationTokenSource = new CancellationTokenSource();
-        eventsConsumerCancellationTokenSource = new CancellationTokenSource();
         concurrencyLimiter = new SemaphoreSlim(maxConcurrency, maxConcurrency);
 
-        // Start main queue consumer
-        messageReceivingTask = ReceiveFromQueue(messageReceivingCancellationTokenSource.Token);
-
-        // Start events consumer (for pub/sub)
-        eventsReceivingTask = ReceiveFromEvents(eventsConsumerCancellationTokenSource.Token);
+        // Single consumer loop handles all messages (unicast, scheduled, and events)
+        // Events are captured by the endpoint stream via subject routing
+        messageReceivingTask = ReceiveMessages(messageReceivingCancellationTokenSource.Token);
 
         return Task.CompletedTask;
     }
@@ -98,7 +98,6 @@ sealed class MessagePump : IMessageReceiver, IDisposable
 
         // Stop receiving new messages
         await messageReceivingCancellationTokenSource.CancelAsync();
-        await eventsConsumerCancellationTokenSource!.CancelAsync();
 
         // Register to cancel message processing when the cancellation token is triggered
         await using (cancellationToken.Register(() => messageProcessingCancellationTokenSource?.Cancel()))
@@ -110,28 +109,27 @@ sealed class MessagePump : IMessageReceiver, IDisposable
             }
         }
 
-        // Wait for the receiving tasks to complete
-        var tasks = new List<Task>();
-        if (messageReceivingTask != null) tasks.Add(messageReceivingTask);
-        if (eventsReceivingTask != null) tasks.Add(eventsReceivingTask);
-
-        try
+        // Wait for the receiving task to complete
+        if (messageReceivingTask != null)
         {
-            await Task.WhenAll(tasks).WaitAsync(CancellationToken.None);
-        }
-        catch (OperationCanceledException)
-        {
-            // Expected
+            try
+            {
+                await messageReceivingTask.WaitAsync(CancellationToken.None);
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected
+            }
         }
 
         concurrencyLimiter?.Dispose();
         messageReceivingCancellationTokenSource?.Dispose();
         messageProcessingCancellationTokenSource?.Dispose();
-        eventsConsumerCancellationTokenSource?.Dispose();
+        consumerIterationCancellationTokenSource?.Dispose();
 
         messageReceivingCancellationTokenSource = null;
         messageProcessingCancellationTokenSource = null;
-        eventsConsumerCancellationTokenSource = null;
+        consumerIterationCancellationTokenSource = null;
     }
 
     public async Task ChangeConcurrency(PushRuntimeSettings limitations, CancellationToken cancellationToken = default)
@@ -142,39 +140,22 @@ sealed class MessagePump : IMessageReceiver, IDisposable
         await StartReceive(cancellationToken);
     }
 
-    public async Task OnSubscriptionChanged()
-    {
-        // Restart the events consumer to pick up new subscriptions
-        if (eventsConsumerCancellationTokenSource != null)
-        {
-            await eventsConsumerCancellationTokenSource.CancelAsync();
-
-            if (eventsReceivingTask != null)
-            {
-                try
-                {
-                    await eventsReceivingTask;
-                }
-                catch (OperationCanceledException)
-                {
-                    // Expected
-                }
-            }
-
-            eventsConsumerCancellationTokenSource = new CancellationTokenSource();
-            eventsReceivingTask = ReceiveFromEvents(eventsConsumerCancellationTokenSource.Token);
-        }
-    }
-
-    async Task ReceiveFromQueue(CancellationToken cancellationToken)
+    async Task ReceiveMessages(CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
         {
             try
             {
-                var consumer = await topologyManager.GetConsumer(receiveAddress, cancellationToken);
+                // Create a linked token that cancels when either:
+                // 1. The message pump is stopping (cancellationToken)
+                // 2. Subscriptions changed (consumerIterationCancellationTokenSource)
+                consumerIterationCancellationTokenSource?.Dispose();
+                consumerIterationCancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                var iterationToken = consumerIterationCancellationTokenSource.Token;
 
-                await foreach (var msg in consumer.ConsumeAsync<byte[]>(cancellationToken: cancellationToken))
+                var consumer = await topologyManager.GetConsumer(receiveAddress, iterationToken);
+
+                await foreach (var msg in consumer.ConsumeAsync<byte[]>(cancellationToken: iterationToken))
                 {
                     // Successfully received a message - disarm circuit breaker
                     circuitBreaker.Success();
@@ -186,56 +167,10 @@ sealed class MessagePump : IMessageReceiver, IDisposable
                 // Expected during shutdown
                 break;
             }
-            catch (Exception ex)
+            catch (OperationCanceledException)
             {
-                // Connection or consumer error - arm circuit breaker
-                try
-                {
-                    await circuitBreaker.Failure(ex, cancellationToken);
-                }
-                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-                {
-                    break;
-                }
-            }
-        }
-    }
-
-    async Task ReceiveFromEvents(CancellationToken cancellationToken)
-    {
-        while (!cancellationToken.IsCancellationRequested)
-        {
-            try
-            {
-                // Check if there are any event subscriptions
-                var eventsConsumer = await topologyManager.GetEventsConsumer(receiveAddress, cancellationToken);
-                if (eventsConsumer == null)
-                {
-                    // No subscriptions, wait until cancelled
-                    await Task.Delay(Timeout.Infinite, cancellationToken);
-                    return;
-                }
-
-                // Use FetchAsync with idle heartbeat to continuously poll for messages
-                while (!cancellationToken.IsCancellationRequested)
-                {
-                    await foreach (var msg in eventsConsumer.FetchAsync<byte[]>(
-                        new NatsJSFetchOpts { MaxMsgs = 100, IdleHeartbeat = TimeSpan.FromSeconds(5) },
-                        cancellationToken: cancellationToken))
-                    {
-                        // Successfully received an event - disarm circuit breaker
-                        circuitBreaker.Success();
-                        await ProcessIncomingMessage(msg, cancellationToken);
-                    }
-
-                    // Brief delay between fetch calls to avoid tight loop
-                    await Task.Delay(100, cancellationToken);
-                }
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                // Expected during shutdown or subscription change
-                break;
+                // Subscription changed - restart the loop with updated consumer filter
+                continue;
             }
             catch (Exception ex)
             {
@@ -281,6 +216,20 @@ sealed class MessagePump : IMessageReceiver, IDisposable
     {
         var originalHeaders = ConvertHeaders(msg.Headers);
         var messageId = GetMessageId(msg, originalHeaders);
+        var body = new ReadOnlyMemory<byte>(msg.Data ?? []);
+
+        // Start receive activity for OpenTelemetry
+        var streamName = msg.Metadata?.Stream ?? "unknown";
+        var consumerName = msg.Metadata?.Consumer ?? "unknown";
+        var subject = msg.Subject;
+
+        using var activity = NatsTransportDiagnostics.StartReceiveActivity(
+            receiveAddress,
+            streamName,
+            consumerName,
+            subject,
+            messageId,
+            body.Length);
 
         // Check for TTBR expiration
         if (IsMessageExpired(originalHeaders))
@@ -289,8 +238,6 @@ sealed class MessagePump : IMessageReceiver, IDisposable
             await msg.AckAsync(cancellationToken: CancellationToken.None);
             return;
         }
-
-        var body = new ReadOnlyMemory<byte>(msg.Data ?? []);
 
         // Create a copy of headers for message context - handlers may modify them
         var messageHeaders = new Dictionary<string, string>(originalHeaders);
@@ -318,6 +265,8 @@ sealed class MessagePump : IMessageReceiver, IDisposable
         }
         catch (Exception ex)
         {
+            NatsTransportDiagnostics.RecordException(activity, ex);
+
             var deliveryAttempts = (int)(msg.Metadata?.NumDelivered ?? 1);
 
             // Use original headers for error context - not the possibly modified ones

@@ -8,7 +8,6 @@ sealed class NatsTransportInfrastructure : TransportInfrastructure
 {
     readonly NatsConnectionManager connectionManager;
     readonly TopologyManager topologyManager;
-    readonly DelayedDeliveryProcessor delayedDeliveryProcessor;
     readonly string streamPrefix;
     readonly List<MessagePump> messagePumps = [];
 
@@ -26,8 +25,6 @@ sealed class NatsTransportInfrastructure : TransportInfrastructure
         this.topologyManager = topologyManager;
         this.streamPrefix = streamPrefix;
 
-        delayedDeliveryProcessor = new DelayedDeliveryProcessor(jetStream, topologyManager);
-
         Receivers = receivers.ToDictionary(
             r => r.Id,
             r =>
@@ -36,7 +33,6 @@ sealed class NatsTransportInfrastructure : TransportInfrastructure
                     r.Id,
                     ToTransportAddress(r.ReceiveAddress),
                     topologyManager,
-                    jetStream,
                     criticalErrorAction,
                     circuitBreakerTimeout,
                     loggerFactory);
@@ -52,16 +48,17 @@ sealed class NatsTransportInfrastructure : TransportInfrastructure
         string[] sendingAddresses,
         CancellationToken cancellationToken = default)
     {
-        // Create the events stream for pub/sub
-        await topologyManager.CreateEventsInfrastructure(cancellationToken);
-
-        // Create delayed delivery infrastructure
-        await topologyManager.CreateDelayedDeliveryInfrastructure(cancellationToken);
-
-        // Start the delayed delivery processor
-        await delayedDeliveryProcessor.Start(cancellationToken);
+        // Create central streams first - endpoint streams source from them
+        // Events stream: captures all published events
+        await topologyManager.CreateEventsStream(cancellationToken);
+        // Delayed stream: handles native NATS scheduling with ready subject delivery
+        await topologyManager.CreateDelayedStream(cancellationToken);
 
         // Create streams and consumers for each receiver
+        // Each endpoint stream:
+        // - Captures unicast messages: {prefix}.endpoint.{endpoint}
+        // - Sources from events stream for subscribed event types
+        // - Sources from delayed stream for ready messages: {prefix}.ready.{endpoint}
         foreach (var receiver in receivers)
         {
             var address = ToTransportAddress(receiver.ReceiveAddress);
@@ -86,9 +83,6 @@ sealed class NatsTransportInfrastructure : TransportInfrastructure
 
     public override async Task Shutdown(CancellationToken cancellationToken = default)
     {
-        await delayedDeliveryProcessor.Stop(cancellationToken);
-        delayedDeliveryProcessor.Dispose();
-
         foreach (var pump in messagePumps)
         {
             pump.Dispose();

@@ -6,7 +6,7 @@ This guide covers deployment, infrastructure setup, and operational tasks for th
 
 ### Minimum Version
 
-NATS Server 2.10 or later with JetStream enabled.
+NATS Server 2.12 or later with JetStream enabled.
 
 ### Enabling JetStream
 
@@ -32,7 +32,7 @@ docker run -d \
   -p 4222:4222 \
   -p 8222:8222 \
   -v nats-data:/data \
-  nats:2.10-alpine \
+  nats:2.12-alpine \
   --jetstream \
   --store_dir /data \
   -m 8222
@@ -72,20 +72,21 @@ For least-privilege deployments, create streams and consumers before starting en
 |---------|-------------|-----------------|
 | Endpoint queue | `{prefix}-{endpoint}` | `{prefix}.endpoint.{endpoint}` |
 | Events (pub/sub) | `{prefix}-events` | `{prefix}.events.>` |
-| Delayed messages | `{prefix}-delayed` | `{prefix}.delayed.>` |
+| Delayed messages | `{prefix}-delayed` | `{prefix}.delayed.>`, `{prefix}.ready.>` |
 
 The default prefix is `nsb`. Endpoint names are lowercased with `.` replaced by `-`.
 
 ### Create Endpoint Stream
 
-For each endpoint, create a stream and consumer:
+For each endpoint, create a stream with sources from the events and delayed streams:
 
 ```bash
 # Variables
 PREFIX="nsb"
 ENDPOINT="orders"
 
-# Create the endpoint stream
+# Create the endpoint stream with sources
+# Note: Sources are configured via the NATS CLI or API
 nats stream add ${PREFIX}-${ENDPOINT} \
   --subjects "${PREFIX}.endpoint.${ENDPOINT}" \
   --retention work \
@@ -97,11 +98,13 @@ nats stream add ${PREFIX}-${ENDPOINT} \
   --max-age=0 \
   --duplicate-window=2m \
   --no-deny-delete \
-  --no-deny-purge
+  --no-deny-purge \
+  --source "${PREFIX}-delayed" \
+  --source-filter-subject "${PREFIX}.ready.${ENDPOINT}"
 
-# Create the consumer
+# Create the consumer (filters to all message types this endpoint receives)
 nats consumer add ${PREFIX}-${ENDPOINT} ${ENDPOINT}-main \
-  --filter "${PREFIX}.endpoint.${ENDPOINT}" \
+  --filter "${PREFIX}.endpoint.${ENDPOINT},${PREFIX}.ready.${ENDPOINT},${PREFIX}.events.>" \
   --ack explicit \
   --wait 30s \
   --max-deliver=-1 \
@@ -110,9 +113,11 @@ nats consumer add ${PREFIX}-${ENDPOINT} ${ENDPOINT}-main \
   --no-headers-only
 ```
 
+**Note**: Event subscriptions add additional sources to the endpoint stream at runtime. Each subscribed event type creates a source from `{prefix}-events` with a filter for that event's subject.
+
 ### Create Events Stream
 
-Create a single shared stream for all pub/sub events:
+Create a single shared stream for all pub/sub events. This acts as a central router - endpoint streams source from it with filters for their subscribed event types.
 
 ```bash
 PREFIX="nsb"
@@ -123,7 +128,7 @@ nats stream add ${PREFIX}-events \
   --storage file \
   --replicas 3 \
   --discard old \
-  --max-msgs=100000 \
+  --max-msgs=-1 \
   --max-bytes=-1 \
   --max-age=1h \
   --duplicate-window=2m \
@@ -131,55 +136,33 @@ nats stream add ${PREFIX}-events \
   --no-deny-purge
 ```
 
-### Create Events Consumer
-
-For each endpoint that subscribes to events, create a consumer with filter subjects:
-
-```bash
-PREFIX="nsb"
-ENDPOINT="orders"
-
-# Create consumer with subscribed event types
-# Filter subjects use sanitized type names: . → - and + → --
-nats consumer add ${PREFIX}-events ${ENDPOINT}-events \
-  --filter "${PREFIX}.events.MyApp-OrderPlaced,${PREFIX}.events.MyApp-OrderShipped" \
-  --ack explicit \
-  --wait 30s \
-  --max-deliver=-1 \
-  --replay instant \
-  --deliver all \
-  --no-headers-only
-```
+**Note**: No consumers are created directly on the events stream. Event subscriptions work through stream sourcing - when an endpoint subscribes to an event type, a source is added to the endpoint's stream with a filter for that event subject. The transport manages these sources automatically at runtime.
 
 ### Create Delayed Delivery Stream
 
+The delayed stream uses native NATS scheduling (NATS 2.12+, ADR-51). Messages are published with `Nats-Schedule` headers, held by NATS until the scheduled time, then delivered to ready subjects which are sourced by endpoint streams.
+
 ```bash
 PREFIX="nsb"
 
-# Create the delayed messages stream
+# Create the delayed messages stream with native scheduling enabled
+# Subjects: delayed.> for incoming scheduled messages, ready.> for delivery
 nats stream add ${PREFIX}-delayed \
-  --subjects "${PREFIX}.delayed.>" \
-  --retention work \
+  --subjects "${PREFIX}.delayed.>,${PREFIX}.ready.>" \
+  --retention limits \
   --storage file \
   --replicas 3 \
   --discard old \
   --max-msgs=-1 \
   --max-bytes=-1 \
-  --max-age=0 \
+  --max-age=1h \
   --duplicate-window=2m \
   --no-deny-delete \
-  --no-deny-purge
-
-# Create the processor consumer
-nats consumer add ${PREFIX}-delayed delayed-processor \
-  --filter "${PREFIX}.delayed.>" \
-  --ack explicit \
-  --wait 30s \
-  --max-deliver=10 \
-  --replay instant \
-  --deliver all \
-  --no-headers-only
+  --no-deny-purge \
+  --allow-msg-schedules
 ```
+
+**Note**: No consumer is created on the delayed stream. Endpoint streams source from `{prefix}.ready.{endpoint}` to receive scheduled messages when they become due. The `--allow-msg-schedules` flag enables native NATS scheduling (requires NATS 2.12+).
 
 ## Shell Script for Endpoint Setup
 
@@ -199,7 +182,7 @@ echo "Prefix: ${PREFIX}, Replicas: ${REPLICAS}"
 # Sanitize endpoint name (lowercase, replace . with -)
 SANITIZED=$(echo "${ENDPOINT}" | tr '[:upper:]' '[:lower:]' | tr '.' '-')
 
-# Create endpoint stream
+# Create endpoint stream with source from delayed stream
 echo "Creating stream: ${PREFIX}-${SANITIZED}"
 nats stream add "${PREFIX}-${SANITIZED}" \
   --subjects "${PREFIX}.endpoint.${SANITIZED}" \
@@ -212,12 +195,14 @@ nats stream add "${PREFIX}-${SANITIZED}" \
   --max-age=0 \
   --duplicate-window=2m \
   --no-deny-delete \
-  --no-deny-purge
+  --no-deny-purge \
+  --source "${PREFIX}-delayed" \
+  --source-filter-subject "${PREFIX}.ready.${SANITIZED}"
 
-# Create consumer
+# Create consumer (filters to unicast, ready, and event subjects)
 echo "Creating consumer: ${SANITIZED}-main"
 nats consumer add "${PREFIX}-${SANITIZED}" "${SANITIZED}-main" \
-  --filter "${PREFIX}.endpoint.${SANITIZED}" \
+  --filter "${PREFIX}.endpoint.${SANITIZED},${PREFIX}.ready.${SANITIZED},${PREFIX}.events.>" \
   --ack explicit \
   --wait 30s \
   --max-deliver=-1 \
@@ -454,7 +439,14 @@ tls {
 ```csharp
 var transport = new NatsTransport("nats://server:4222")
 {
-    // TLS is configured in NatsOpts if needed
+    ConfigureNatsOptions = opts => opts with
+    {
+        TlsOpts = new NatsTlsOpts
+        {
+            Mode = TlsMode.Require,
+            CaFile = "/etc/nats/ca.pem"
+        }
+    }
 };
 ```
 

@@ -17,7 +17,7 @@ jobs:
     steps:
       - name: Start NATS with JetStream
         run: |
-          docker run -d --name nats -p 4222:4222 -p 8222:8222 nats:2.10-alpine --jetstream -m 8222
+          docker run -d --name nats -p 4222:4222 -p 8222:8222 nats:2.12-alpine --jetstream -m 8222
           $timeout = 30
           for ($i = 0; $i -lt $timeout; $i++) {
             try {
@@ -47,6 +47,8 @@ jobs:
           echo "VERSION=$version" >> $env:GITHUB_OUTPUT
       - name: Build
         run: dotnet build src/Community.NServiceBus.Transport.Nats --configuration Release -p:Version=${{ steps.version.outputs.VERSION }}
+      - name: Run Unit Tests
+        run: dotnet test src/Community.NServiceBus.Transport.Nats.Tests --configuration Release --verbosity normal
       - name: Run Transport Tests
         run: dotnet test src/Community.NServiceBus.Transport.Nats.TransportTests --configuration Release --no-build --verbosity normal
         env:

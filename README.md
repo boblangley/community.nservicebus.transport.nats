@@ -22,7 +22,7 @@ The tests default to `nats://localhost:4222`. You can override this using the `N
 ### Start NATS with JetStream
 
 ```bash
-docker run -d --name nats -p 4222:4222 -p 8222:8222 nats:2.10-alpine --jetstream -m 8222
+docker run -d --name nats -p 4222:4222 -p 8222:8222 nats:2.12-alpine --jetstream -m 8222
 ```
 
 ### Run the tests
