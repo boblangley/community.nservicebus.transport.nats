@@ -1,0 +1,47 @@
+namespace NServiceBus
+{
+    public sealed class NatsHealthCheck : Microsoft.Extensions.Diagnostics.HealthChecks.IHealthCheck
+    {
+        public NatsHealthCheck(NServiceBus.NatsTransport transport, string? name = null) { }
+        public System.Threading.Tasks.Task<Microsoft.Extensions.Diagnostics.HealthChecks.HealthCheckResult> CheckHealthAsync(Microsoft.Extensions.Diagnostics.HealthChecks.HealthCheckContext context, System.Threading.CancellationToken cancellationToken = default) { }
+    }
+    public sealed class NatsHealthCheckOptions
+    {
+        public NatsHealthCheckOptions() { }
+        public Microsoft.Extensions.Diagnostics.HealthChecks.HealthStatus? FailureStatus { get; set; }
+        public string Name { get; set; }
+        public System.Collections.Generic.IEnumerable<string> Tags { get; set; }
+    }
+    public sealed class NatsTcpHealthProbe : Microsoft.Extensions.Hosting.IHostedService, System.IDisposable
+    {
+        public NatsTcpHealthProbe(NServiceBus.NatsTransport transport, NServiceBus.NatsTcpHealthProbeOptions options, Microsoft.Extensions.Logging.ILoggerFactory? loggerFactory = null) { }
+        public void Dispose() { }
+        public System.Threading.Tasks.Task StartAsync(System.Threading.CancellationToken cancellationToken) { }
+        public System.Threading.Tasks.Task StopAsync(System.Threading.CancellationToken cancellationToken) { }
+    }
+    public sealed class NatsTcpHealthProbeOptions
+    {
+        public NatsTcpHealthProbeOptions() { }
+        public string BindAddress { get; set; }
+        public int Port { get; set; }
+    }
+    public sealed class NatsTransport : NServiceBus.Transport.TransportDefinition
+    {
+        public NatsTransport(string connectionString) { }
+        public System.TimeSpan AckWait { get; set; }
+        public System.Func<NATS.Client.Core.NatsOpts, NATS.Client.Core.NatsOpts>? ConfigureNatsOptions { get; set; }
+        public string? ConnectionName { get; set; }
+        public string ConnectionString { get; }
+        public Microsoft.Extensions.Logging.ILoggerFactory? LoggerFactory { get; set; }
+        public string StreamPrefix { get; set; }
+        public System.TimeSpan TimeToWaitBeforeTriggeringCircuitBreaker { get; set; }
+        public NATS.Client.Core.NatsConnectionState GetConnectionState() { }
+        public override System.Collections.Generic.IReadOnlyCollection<NServiceBus.TransportTransactionMode> GetSupportedTransactionModes() { }
+        public override System.Threading.Tasks.Task<NServiceBus.Transport.TransportInfrastructure> Initialize(NServiceBus.Transport.HostSettings hostSettings, NServiceBus.Transport.ReceiveSettings[] receivers, string[] sendingAddresses, System.Threading.CancellationToken cancellationToken = default) { }
+    }
+    public static class NatsTransportDiagnostics
+    {
+        public const string ActivitySourceName = "NServiceBus.Transport.Nats";
+        public static System.Diagnostics.ActivitySource ActivitySource { get; }
+    }
+}

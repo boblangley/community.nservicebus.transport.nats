@@ -1,6 +1,6 @@
 # Configuration Guide
 
-This guide covers how to configure and use the NATS JetStream transport for NServiceBus.
+This guide covers NATS transport-specific configuration options.
 
 ## Installation
 
@@ -47,18 +47,6 @@ var transport = new NatsTransport("nats://localhost:4222")
 
 Increase this for long-running message handlers.
 
-### Message Deduplication
-
-JetStream provides server-side message deduplication:
-
-```csharp
-var transport = new NatsTransport("nats://localhost:4222")
-{
-    EnableMessageDeduplication = true,       // Default: true
-    DeduplicationWindow = TimeSpan.FromMinutes(5)  // Default: 2 minutes
-};
-```
-
 ## Connection Configuration
 
 ### Connection String
@@ -81,6 +69,84 @@ var transport = new NatsTransport("nats://mytoken@localhost:4222");
 var transport = new NatsTransport("nats://user:password@localhost:4222");
 ```
 
+**NKey authentication:**
+```csharp
+var transport = new NatsTransport("nats://localhost:4222")
+{
+    ConfigureNatsOptions = opts => opts with
+    {
+        AuthOpts = NatsAuthOpts.Default with
+        {
+            NKey = "UAXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+            Seed = "SUAXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+        }
+    }
+};
+```
+
+**JWT authentication with credentials file:**
+```csharp
+var transport = new NatsTransport("nats://localhost:4222")
+{
+    ConfigureNatsOptions = opts => opts with
+    {
+        AuthOpts = new NatsAuthOpts { CredsFile = "/path/to/user.creds" }
+    }
+};
+```
+
+### TLS Configuration
+
+**Require TLS:**
+```csharp
+var transport = new NatsTransport("nats://localhost:4222")
+{
+    ConfigureNatsOptions = opts => opts with
+    {
+        TlsOpts = new NatsTlsOpts
+        {
+            Mode = TlsMode.Require
+        }
+    }
+};
+```
+
+**Mutual TLS (mTLS) with client certificates:**
+```csharp
+var transport = new NatsTransport("nats://localhost:4222")
+{
+    ConfigureNatsOptions = opts => opts with
+    {
+        TlsOpts = new NatsTlsOpts
+        {
+            Mode = TlsMode.Require,
+            CertFile = "/path/to/client-cert.pem",
+            KeyFile = "/path/to/client-key.pem",
+            CaFile = "/path/to/ca.pem"
+        }
+    }
+};
+```
+
+### Advanced NATS Options
+
+The `ConfigureNatsOptions` callback provides full access to the NATS client configuration. The transport configures sensible defaults, then your callback can customize any option:
+
+```csharp
+var transport = new NatsTransport("nats://localhost:4222")
+{
+    ConfigureNatsOptions = opts => opts with
+    {
+        // Override any NatsOpts property
+        RequestTimeout = TimeSpan.FromSeconds(10),
+        CommandTimeout = TimeSpan.FromSeconds(5),
+        // Combine with auth/TLS as needed
+        AuthOpts = new NatsAuthOpts { /* ... */ },
+        TlsOpts = new NatsTlsOpts { /* ... */ }
+    }
+};
+```
+
 ### Connection Resilience
 
 The NATS.Net client handles reconnection automatically with exponential backoff. Configure the circuit breaker timeout:
@@ -92,7 +158,7 @@ var transport = new NatsTransport("nats://localhost:4222")
 };
 ```
 
-If the transport cannot connect within this time, it triggers a critical error.
+If the transport cannot reconnect within this time, it triggers a critical error.
 
 ## Logging
 
@@ -105,147 +171,79 @@ var transport = new NatsTransport("nats://localhost:4222")
 };
 ```
 
-## Delayed Delivery
+## Health Checks
 
-Send messages for future delivery using standard NServiceBus APIs:
+The transport provides two health check options for containerized deployments.
 
-```csharp
-// Delay by duration
-var options = new SendOptions();
-options.DelayDeliveryWith(TimeSpan.FromMinutes(30));
-await context.Send(new ProcessOrder(), options);
+### ASP.NET Core Integration
 
-// Deliver at specific time
-var options = new SendOptions();
-options.DoNotDeliverBefore(DateTimeOffset.UtcNow.AddHours(2));
-await context.Send(new SendReminder(), options);
-```
-
-Delayed messages are stored in a dedicated stream and forwarded when their delivery time arrives.
-
-## Time-To-Be-Received (TTBR)
-
-Set message expiration to discard stale messages:
-
-```csharp
-[TimeToBeReceived("00:05:00")]  // Expires after 5 minutes
-public class StockQuote : IMessage
-{
-    public string Symbol { get; set; }
-    public decimal Price { get; set; }
-}
-```
-
-> **Note:** TTBR and delayed delivery cannot be combined on the same message.
-
-## Publishing Events
-
-### Basic Publishing
-
-```csharp
-public class OrderPlacedHandler : IHandleMessages<PlaceOrder>
-{
-    public async Task Handle(PlaceOrder message, IMessageHandlerContext context)
-    {
-        // Process order...
-
-        await context.Publish(new OrderPlaced { OrderId = message.OrderId });
-    }
-}
-```
-
-### Polymorphic Subscriptions
-
-The transport supports subscribing to base types and interfaces:
-
-```csharp
-// Event hierarchy
-public interface IOrderEvent { Guid OrderId { get; } }
-public class OrderPlaced : IOrderEvent { public Guid OrderId { get; set; } }
-public class OrderShipped : IOrderEvent { public Guid OrderId { get; set; } }
-
-// Subscribe to all order events
-public class OrderAuditHandler : IHandleMessages<IOrderEvent>
-{
-    public Task Handle(IOrderEvent message, IMessageHandlerContext context)
-    {
-        // Handles OrderPlaced, OrderShipped, and any future IOrderEvent
-        Console.WriteLine($"Order event: {message.OrderId}");
-        return Task.CompletedTask;
-    }
-}
-```
-
-### Duplicate Handling with Outbox
-
-When subscribing to multiple types in the same hierarchy (e.g., both `OrderPlaced` and `IOrderEvent`), enable the Outbox for idempotent processing:
-
-```csharp
-var endpointConfiguration = new EndpointConfiguration("MyEndpoint");
-
-// Enable Outbox
-endpointConfiguration.EnableOutbox();
-
-// Configure persistence for Outbox storage
-var persistence = endpointConfiguration.UsePersistence<SqlPersistence>();
-persistence.ConnectionBuilder(() => new SqlConnection(connectionString));
-```
-
-The Outbox ensures each message is processed exactly once based on its `NServiceBus.MessageId`.
-
-## Transaction Modes
-
-The transport supports two transaction modes:
-
-| Mode | Description |
-|------|-------------|
-| `None` | No transaction guarantees. Messages may be lost on failure. |
-| `ReceiveOnly` | Messages are acknowledged after successful processing. Default and recommended. |
+For applications using ASP.NET Core, integrate with the health check middleware:
 
 ```csharp
 var transport = new NatsTransport("nats://localhost:4222");
-transport.TransportTransactionMode = TransportTransactionMode.ReceiveOnly;
+endpointConfiguration.UseTransport(transport);
+
+// Register health check
+services.AddNatsHealthCheck(transport, options =>
+{
+    options.Name = "nats";
+    options.Tags = ["ready"];
+});
+
+// Map health endpoint
+app.MapHealthChecks("/health");
 ```
 
-> **Note:** `SendsAtomicWithReceive` and `TransactionScope` are not supported. JetStream does not support distributed transactions.
+### TCP Health Probe
 
-## Health Checks
-
-Add NATS health checks to ASP.NET Core:
+For worker services or any container orchestration (Kubernetes, Docker, etc.), use the TCP health probe:
 
 ```csharp
-// In Program.cs
-builder.Services.AddHealthChecks()
-    .AddCheck<NatsHealthCheck>("nats");
+var transport = new NatsTransport("nats://localhost:4222");
+endpointConfiguration.UseTransport(transport);
 
-// Register the health check with the NATS connection
-builder.Services.AddSingleton<NatsHealthCheck>(sp =>
-    new NatsHealthCheck(natsConnection));
+// Register TCP health probe
+services.AddNatsTcpHealthProbe(transport, options =>
+{
+    options.Port = 8081;
+    options.BindAddress = "0.0.0.0";  // default
+});
 ```
 
-Or use the extension method if you have access to the connection:
+The probe accepts TCP connections and responds with `OK\n` when healthy or `FAIL\n` when unhealthy.
 
-```csharp
-builder.Services.AddHealthChecks()
-    .AddNats(natsConnection, name: "nats", tags: new[] { "ready" });
+**Kubernetes:**
+```yaml
+livenessProbe:
+  tcpSocket:
+    port: 8081
 ```
 
-## Concurrency
-
-Configure message processing concurrency:
-
-```csharp
-var endpointConfiguration = new EndpointConfiguration("MyEndpoint");
-endpointConfiguration.LimitMessageProcessingConcurrencyTo(16);  // Default: number of logical processors
+**Docker/Docker Compose:**
+```yaml
+healthcheck:
+  test: ["CMD", "nc", "-z", "localhost", "8081"]
+  interval: 30s
 ```
+
+### Health States
+
+Both health checks report:
+- **Healthy**: Connection is open
+- **Degraded**: Connection is connecting or reconnecting
+- **Unhealthy**: Connection is closed
+
+## Transaction Modes
+
+The transport supports `ReceiveOnly` (default) and `None` transaction modes. `SendsAtomicWithReceive` and `TransactionScope` are not supported because JetStream does not support distributed transactions.
 
 ## Requirements
 
 - .NET 10.0 or later
 - NServiceBus 10.0 or later
-- NATS Server 2.10+ with JetStream enabled
+- NATS Server 2.12+ with JetStream enabled (required for native scheduled message delivery)
 
 ## Next Steps
 
-- [Operations Guide](operations.md) - Deployment and infrastructure setup
+- [Operations Guide](operations.md) - Deployment and NATS CLI commands
 - [Architecture](architecture.md) - Technical implementation details

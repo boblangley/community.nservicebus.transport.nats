@@ -14,10 +14,10 @@ src/
     NatsTransport.cs                           # Entry point, TransportDefinition
     NatsTransportInfrastructure.cs             # Creates pumps/dispatcher
     Sending/MessageDispatcher.cs               # Sends messages to JetStream
-    Receiving/MessagePump.cs                   # Receives messages from JetStream
-    Administration/TopologyManager.cs          # Manages streams/consumers
-    Administration/SubscriptionManager.cs      # Manages event subscriptions
-    DelayedDelivery/DelayedDeliveryProcessor.cs # Forwards delayed messages
+    Receiving/MessagePump.cs                   # Single consumer loop for all message types
+    Administration/TopologyManager.cs          # Manages streams/consumers, subscription management
+    Administration/SubscriptionManager.cs      # NServiceBus ISubscriptionManager implementation
+    Diagnostics/NatsTransportDiagnostics.cs    # OpenTelemetry instrumentation
   Community.NServiceBus.Transport.Nats.TransportTests/     # Unit/integration tests
   Community.NServiceBus.Transport.Nats.AcceptanceTests/    # End-to-end tests
 
@@ -30,21 +30,29 @@ docs/
 ## Key Concepts
 
 ### Stream Topology
-- `{prefix}-{endpoint}` - Per-endpoint stream for unicast messages
-- `{prefix}-events` - Shared stream for pub/sub events
-- `{prefix}-delayed` - Stores messages for future delivery
+- `{prefix}-events` - Central events stream captures all published events
+- `{prefix}-delayed` - Central delayed stream with native scheduling (AllowMsgSchedules=true)
+- `{prefix}-{endpoint}` - Per-endpoint stream with Sources from events and delayed streams
+- `{prefix}-{endpoint}-error` - Error queue stream
 
 ### Message Flow
 
 1. **Unicast**: Publish to `{prefix}.endpoint.{destination}` → endpoint stream → consumer
-2. **Multicast**: Publish to `{prefix}.events.{type}` for each type in hierarchy → events stream → filtered consumers
-3. **Delayed**: Store in delayed stream → processor polls → forwards when due
+2. **Multicast**: Publish to `{prefix}.events.{type}` → central events stream → sourcing copies to subscribed endpoint streams → consumer
+3. **Delayed**: Publish to `{prefix}.delayed.{endpoint}.{id}` with `Nats-Schedule` headers → NATS holds until scheduled time → delivers to `{prefix}.ready.{endpoint}` → sourcing copies to endpoint stream → consumer
+
+### JetStream Sourcing
+Endpoint streams use Sources (server-side message copying) to receive events and delayed messages:
+- Sources from `{prefix}-events` with filter for subscribed event types
+- Sources from `{prefix}-delayed` with filter `{prefix}.ready.{endpoint}`
+
+**Constraint**: Streams with Sources cannot have `AllowMsgSchedules = true` (mutually exclusive). This is why we use separate central streams.
 
 ## Running Tests
 
 ```bash
 # Start NATS (devcontainer has this pre-configured)
-docker run -d --name nats -p 4222:4222 nats:2.10-alpine --jetstream
+docker run -d --name nats -p 4222:4222 nats:2.12-alpine --jetstream
 
 # Run tests
 dotnet test src/Community.NServiceBus.Transport.Nats.TransportTests
@@ -79,18 +87,21 @@ Follows Particular's conventions:
 # Watch messages in real-time
 nats sub "nsb.>"
 
-# View stream contents
-nats stream view nsb-events --count 10
+# View endpoint stream contents (includes unicast, events, scheduled)
+nats stream view nsb-sales --count 10
 
 # Check consumer state
-nats consumer info nsb-events myendpoint-events
+nats consumer info nsb-sales sales-main
+
+# View stream subjects (to see subscribed event types)
+nats stream info nsb-sales
 ```
 
 ## Important Files
 
 | File | Purpose |
 |------|---------|
-| `MessageDispatcher.cs` | All message sending logic, polymorphic publishing |
-| `MessagePump.cs` | Message receiving, concurrency control |
-| `TopologyManager.cs` | Stream/consumer CRUD operations |
-| `DelayedDeliveryProcessor.cs` | Background worker for delayed messages |
+| `MessageDispatcher.cs` | All message sending logic, polymorphic publishing, delayed delivery |
+| `MessagePump.cs` | Single consumer loop, concurrency control |
+| `TopologyManager.cs` | Stream/consumer CRUD, manages Sources for subscriptions |
+| `NatsTransportDiagnostics.cs` | OpenTelemetry instrumentation |

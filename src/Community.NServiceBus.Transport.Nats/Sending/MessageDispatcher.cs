@@ -152,8 +152,11 @@ sealed class MessageDispatcher : IMessageDispatcher
             headers[TimeToBeReceivedHeader] = expiresAt.ToUnixTimeMilliseconds().ToString();
         }
 
-        // Publish to all types in the hierarchy for polymorphic subscriptions
-        // All messages have the same NServiceBus.MessageId for Outbox deduplication
+        // Publish to all types in the hierarchy for polymorphic subscriptions.
+        // Each type gets a UNIQUE Nats-Msg-Id so they're not deduplicated in the events stream.
+        // This allows endpoints filtering on specific types to receive the message.
+        // Note: An endpoint subscribing to multiple types in the same hierarchy will receive
+        // multiple copies - this is consistent with other message broker behavior.
         var body = operation.Message.Body.ToArray();
 
         foreach (var typeName in typeHierarchy)
@@ -163,21 +166,21 @@ sealed class MessageDispatcher : IMessageDispatcher
             // Create a fresh copy of headers for each publish (NatsHeaders becomes read-only after publish)
             var publishHeaders = CloneHeaders(headers);
 
-            // Use unique Nats-Msg-Id per subject to avoid JetStream deduplication
-            // Format: {messageId}-{sanitized-type-name}
-            // The NServiceBus.MessageId header remains the same for Outbox deduplication
-            var sanitizedTypeName = typeName.Replace(".", "-").Replace("+", "--");
-            var natsMsgId = $"{messageId}-{sanitizedTypeName}";
-            publishHeaders["Nats-Msg-Id"] = natsMsgId;
+            // Use a unique Nats-Msg-Id per type to avoid deduplication
+            // Format: {messageId}-{sanitizedTypeName}
+            var typeSpecificMsgId = $"{messageId}-{SanitizeForMsgId(typeName)}";
+            publishHeaders["Nats-Msg-Id"] = typeSpecificMsgId;
 
             using var activity = NatsTransportDiagnostics.StartPublishActivity(
                 typeName,
                 subject,
-                natsMsgId,
+                typeSpecificMsgId,
                 body.Length);
 
             try
             {
+                // Publish to central events stream - it captures all events.>
+                // Endpoint streams source from it with filters for their subscribed types
                 await jetStream.PublishAsync(
                     subject,
                     body,
@@ -190,6 +193,12 @@ sealed class MessageDispatcher : IMessageDispatcher
                 throw;
             }
         }
+    }
+
+    static string SanitizeForMsgId(string typeName)
+    {
+        // Replace characters that might cause issues in message IDs
+        return typeName.Replace("+", "-").Replace(".", "-");
     }
 
     static NatsHeaders CloneHeaders(NatsHeaders source)
@@ -252,11 +261,16 @@ sealed class MessageDispatcher : IMessageDispatcher
         DateTimeOffset deliverAt,
         CancellationToken cancellationToken)
     {
-        // Use native NATS scheduling (NATS 2.12+, ADR-51)
-        // The message is published to a unique schedule subject within the destination's stream.
-        // ADR-51 requirement: Nats-Schedule-Target must point to a subject in the SAME stream.
-        // NATS server holds the message and automatically delivers it to the target
-        // subject at the scheduled time, then purges the schedule entry.
+        // Use native NATS scheduling (NATS 2.12+, ADR-51) with central delayed stream.
+        // Architecture:
+        // 1. Message published to central {prefix}-delayed stream at {prefix}.delayed.{endpoint}.{id}
+        // 2. NATS holds the message until the scheduled time
+        // 3. At delivery time, NATS moves message to {prefix}.ready.{endpoint} (same stream)
+        // 4. Endpoint stream sources from delayed stream with filter {prefix}.ready.{endpoint}
+        // 5. Sourcing automatically copies the ready message to the endpoint stream
+        //
+        // This provides horizontal scaling - any instance's message pump consumes from
+        // the endpoint stream, and sourcing handles the delivery automatically.
 
         var messageId = headers.TryGetValue("Nats-Msg-Id", out var msgIdValues) && msgIdValues.Count > 0
             ? msgIdValues[0]
@@ -266,22 +280,23 @@ sealed class MessageDispatcher : IMessageDispatcher
         // This is critical for delayed retries - each retry is a new scheduled message
         var scheduleMsgId = $"{messageId}-sched-{deliverAt.ToUnixTimeMilliseconds()}";
 
-        // Schedule subject is within the destination endpoint's stream (same stream as target)
-        var scheduleSubject = topologyManager.GetScheduleSubject(destination, scheduleMsgId);
+        // Delayed subject is in the central delayed stream
+        var delayedSubject = topologyManager.GetDelayedSubject(destination, scheduleMsgId);
 
-        // Target subject where the message will be delivered at the scheduled time
-        var targetSubject = topologyManager.GetEndpointSubject(destination);
+        // Target is the ready subject - also in the delayed stream (ADR-51 requirement)
+        // Endpoint streams source from this ready subject
+        var readySubject = topologyManager.GetReadySubject(destination);
 
         // Set native scheduling headers
         // Format: @at {RFC3339 timestamp}
         headers[NatsScheduleHeader] = $"@at {deliverAt.UtcDateTime:O}";
-        headers[NatsScheduleTargetHeader] = targetSubject;
+        headers[NatsScheduleTargetHeader] = readySubject;
 
         // Make sure Nats-Msg-Id is unique for each scheduled message
         headers["Nats-Msg-Id"] = scheduleMsgId;
 
         await jetStream.PublishAsync(
-            scheduleSubject,
+            delayedSubject,
             body.ToArray(),
             headers: headers,
             cancellationToken: cancellationToken);

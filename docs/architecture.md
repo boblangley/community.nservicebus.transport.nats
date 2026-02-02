@@ -1,260 +1,237 @@
 # Architecture
 
-This document describes the technical implementation of the NATS JetStream transport for NServiceBus.
+This document describes how the NServiceBus NATS transport implements NServiceBus messaging capabilities using NATS JetStream features.
 
-## Overview
+## Requirements
 
-The transport implements the NServiceBus `TransportDefinition` abstraction using NATS JetStream for durable messaging. JetStream provides at-least-once delivery guarantees with message persistence and replay capabilities.
+- **NATS Server 2.12+** - Required for native message scheduling (ADR-51)
+- **JetStream enabled** - Required for durable messaging
 
-## Key Components
+## NServiceBus Capabilities
 
-### NatsTransport
+### Unicast Messaging (Send)
 
-The entry point that extends `TransportDefinition`. Configures transport settings and creates the infrastructure.
+**NServiceBus capability**: Send a message to a specific endpoint.
 
+**NATS implementation**: Each endpoint has a dedicated JetStream stream that captures messages published to its subject.
+
+| Component | Implementation |
+|-----------|----------------|
+| Stream | `{prefix}-{endpoint}` with WorkQueue retention |
+| Subject | `{prefix}.endpoint.{endpoint}` |
+| Consumer | Durable consumer with explicit ack |
+| Delivery | At-least-once via JetStream ack/nak |
+
+**Message flow**:
 ```
-NatsTransport : TransportDefinition
-├── Initialize() → NatsTransportInfrastructure
-└── Configuration properties (StreamPrefix, AckWait, etc.)
-```
-
-### NatsTransportInfrastructure
-
-Creates receivers and dispatchers, manages the NATS connection lifecycle.
-
-```
-NatsTransportInfrastructure : TransportInfrastructure
-├── Receivers[] → MessagePump instances
-├── Dispatcher → MessageDispatcher
-├── ConnectionManager → NatsConnectionManager
-└── TopologyManager → Stream/consumer management
+Sender → publish to subject → Stream captures → Consumer delivers → Endpoint processes → Ack
 ```
 
-### MessagePump
+**Key code**: `MessageDispatcher.SendUnicast()` publishes to the endpoint subject. If the destination stream doesn't exist, it's created lazily via `TopologyManager.EnsureEndpointStreamExists()`.
 
-Implements `IMessageReceiver` for consuming messages from JetStream. Each endpoint has one pump that handles both:
+### Publish/Subscribe
 
-- **Queue messages**: Direct sends to the endpoint (unicast)
-- **Event messages**: Pub/sub events the endpoint subscribes to
+**NServiceBus capability**: Publish an event to all interested subscribers.
 
-```
-MessagePump : IMessageReceiver
-├── ReceiveFromQueue() → Consumes from endpoint stream
-├── ReceiveFromEvents() → Consumes from events stream with filters
-├── ProcessMessage() → Invokes NServiceBus pipeline
-└── Concurrency control via SemaphoreSlim
-```
+**NATS implementation**: Uses a central events stream with JetStream sourcing. Events are published to the central stream, and endpoint streams source from it with filters for their subscribed event types.
 
-### MessageDispatcher
+| Component | Implementation |
+|-----------|----------------|
+| Central Stream | `{prefix}-events` captures all `{prefix}.events.>` subjects |
+| Subject | `{prefix}.events.{event-type}` |
+| Sourcing | Endpoint streams source from events stream with filter subjects |
+| Consumer | `{endpoint}-main` consumer handles unicast and sourced events |
 
-Implements `IMessageDispatcher` for sending messages to JetStream.
+**How it works**:
+1. Central events stream created at startup, captures all `{prefix}.events.>` subjects
+2. Endpoint subscribes to event type (e.g., `OrderPlaced`)
+3. `TopologyManager.SubscribeToEvent()` adds a Source to endpoint stream with filter `{prefix}.events.MyApp-OrderPlaced`
+4. Publisher calls `MessageDispatcher.SendMulticast()` which publishes to `{prefix}.events.MyApp-OrderPlaced`
+5. JetStream sourcing automatically copies matching messages to endpoint streams
+6. Single consumer loop delivers the event for processing
 
-```
-MessageDispatcher : IMessageDispatcher
-├── SendUnicast() → Publish to endpoint subject
-├── SendMulticast() → Publish to type hierarchy subjects
-└── SendDelayed() → Publish to delayed stream
-```
-
-### TopologyManager
-
-Manages JetStream streams and consumers.
+**Polymorphic publishing**: Events are published to separate subjects for each type in the hierarchy, with unique message IDs per type:
 
 ```
-TopologyManager
-├── CreateEndpointInfrastructure() → Endpoint stream + consumer
-├── CreateEventsInfrastructure() → Shared events stream
-├── CreateDelayedDeliveryInfrastructure() → Delayed messages stream
-├── SubscribeToEvent() → Update consumer filter subjects
-└── UnsubscribeFromEvent() → Update consumer filter subjects
+class OrderPlaced : OrderEvent, IOrderEvent { }
+
+// Published to three subjects with unique IDs:
+// - {prefix}.events.MyApp-OrderPlaced (ID: {msgId}-MyApp-OrderPlaced)
+// - {prefix}.events.MyApp-OrderEvent (ID: {msgId}-MyApp-OrderEvent)
+// - {prefix}.events.MyApp-IOrderEvent (ID: {msgId}-MyApp-IOrderEvent)
 ```
 
-### DelayedDeliveryProcessor
+**Note**: An endpoint subscribing to multiple types in the same hierarchy will receive multiple copies of the message. This is consistent with other message broker behavior.
 
-Background worker that polls the delayed stream and forwards messages when their delivery time arrives.
+**Subscription management**: When an endpoint subscribes to an event type, `TopologyManager.SubscribeToEvent()` adds a Source from the events stream with the appropriate filter subject.
 
-```
-DelayedDeliveryProcessor
-├── ProcessDelayedMessages() → Polling loop
-├── ProcessDelayedMessage() → Check time, forward or NAK
-└── Forward to destination (unicast or multicast)
-```
+**Benefits**:
+- Single consumer per endpoint simplifies concurrency control
+- Single queue depth metric for autoscaling
+- WorkQueue retention automatically cleans up processed events
+- Horizontal scaling via shared durable consumer
 
-## Stream Topology
-
-The transport creates three types of JetStream streams:
-
-### Endpoint Streams
-
-One stream per endpoint for direct (unicast) messaging.
-
-```
-Stream: {prefix}-{endpoint}
-Subject: {prefix}.endpoint.{endpoint}
-Retention: WorkQueue (delete after ack)
-Consumer: {endpoint}-main (durable, explicit ack)
-```
-
-### Events Stream
-
-Shared stream for all pub/sub events.
-
-```
-Stream: {prefix}-events
-Subject: {prefix}.events.>
-Retention: Limits (time/count based)
-Consumers: {endpoint}-events per subscribing endpoint
-           with FilterSubjects for subscribed types
-```
-
-### Delayed Stream
-
-Stores messages for future delivery.
-
-```
-Stream: {prefix}-delayed
-Subject: {prefix}.delayed.>
-Retention: WorkQueue
-Consumer: delayed-processor (single, shared)
-```
-
-## Message Flow
-
-### Send (Unicast)
-
-```
-Sender → MessageDispatcher.SendUnicast()
-       → jetStream.PublishAsync(subject: "{prefix}.endpoint.{destination}")
-       → Endpoint Stream
-       → MessagePump.ReceiveFromQueue()
-       → NServiceBus Pipeline
-       → msg.AckAsync()
-```
-
-### Publish (Multicast)
-
-```
-Publisher → MessageDispatcher.SendMulticast()
-          → GetTypeHierarchy(messageType) → [ConcreteType, BaseClass, IInterface]
-          → For each type:
-              jetStream.PublishAsync(subject: "{prefix}.events.{type}")
-          → Events Stream
-          → Subscribers with matching FilterSubjects
-          → MessagePump.ReceiveFromEvents()
-          → NServiceBus Pipeline
-          → msg.AckAsync()
-```
+**Key code**:
+- `MessageDispatcher.SendMulticast()` - publishes to type hierarchy subjects with unique IDs
+- `TopologyManager.SubscribeToEvent()` - adds source filter to endpoint stream
+- `MessagePump.ReceiveMessages()` - single loop handles all message types
 
 ### Delayed Delivery
 
+**NServiceBus capability**: Deliver a message at a future time (used for saga timeouts, delayed retries).
+
+**NATS implementation**: Uses a central delayed stream with native NATS message scheduling (ADR-51). Scheduled messages are delivered to a "ready" subject, which is sourced by endpoint streams.
+
+| Header | Purpose |
+|--------|---------|
+| `Nats-Schedule` | `@at {RFC3339 timestamp}` - when to deliver |
+| `Nats-Schedule-Target` | Ready subject for delivery |
+
+**Architecture**:
 ```
-Sender → MessageDispatcher.SendDelayed()
-       → Add headers: DeliveryAt, Destination, IsMulticast
-       → jetStream.PublishAsync(subject: "{prefix}.delayed.{destination}")
-       → Delayed Stream
+{prefix}-delayed stream (central)
+  Subjects: {prefix}.delayed.>, {prefix}.ready.>
+  AllowMsgSchedules: true
 
-DelayedDeliveryProcessor (polling):
-       → FetchAsync from delayed consumer
-       → If DeliveryAt <= now:
-           Forward to destination (unicast or multicast)
-           msg.AckAsync()
-       → Else:
-           msg.NakAsync(delay: min(timeUntilDelivery, 30s))
-```
-
-## Polymorphic Event Publishing
-
-When publishing an event, the transport publishes to subjects for the entire type hierarchy:
-
-```csharp
-class OrderPlaced : OrderEvent, IOrderEvent { }
-
-// Publishes to:
-// - {prefix}.events.MyApp-OrderPlaced
-// - {prefix}.events.MyApp-OrderEvent
-// - {prefix}.events.MyApp-IOrderEvent
+{prefix}-{endpoint} stream (per-endpoint)
+  Sources from delayed stream with filter: {prefix}.ready.{endpoint}
 ```
 
-Each publish uses a unique `Nats-Msg-Id` per subject to avoid JetStream deduplication:
-```
-{messageId}-{sanitized-type-name}
-```
+**How it works**:
+1. Message published to `{prefix}.delayed.{endpoint}.{message-id}` in central delayed stream
+2. NATS server holds the message until the scheduled time (native ADR-51 scheduling)
+3. At delivery time, NATS moves message to `{prefix}.ready.{endpoint}` (same stream)
+4. Endpoint stream sources from delayed stream with filter `{prefix}.ready.{endpoint}`
+5. Sourcing automatically copies the ready message to the endpoint stream
+6. Consumer delivers the message for processing
 
-The `NServiceBus.MessageId` header remains the same across all publishes for Outbox deduplication.
+**Why central delayed stream**: JetStream doesn't allow streams to have both `Sources` and `AllowMsgSchedules`. Using a central delayed stream allows endpoint streams to use Sources for both events and delayed messages, while the central stream handles scheduling.
 
-## Subscription Management
+**Horizontal scaling**: All endpoint instances share the same durable consumer. When a scheduled message becomes ready, sourcing copies it to the endpoint stream, and any instance can process it.
 
-Subscriptions are managed by updating the consumer's `FilterSubjects`:
+**Key code**: `MessageDispatcher.SendDelayed()` publishes to the delayed stream with native scheduling headers and the ready subject as target.
 
-```csharp
-// Subscribe to OrderPlaced
-await topologyManager.SubscribeToEvent("MyEndpoint", "MyApp.OrderPlaced");
+### Recoverability
 
-// Consumer config updated:
-// FilterSubjects: ["nsb.events.MyApp-OrderPlaced"]
+**NServiceBus capability**: Retry failed messages with configurable policies.
 
-// Subscribe to another event
-await topologyManager.SubscribeToEvent("MyEndpoint", "MyApp.OrderCancelled");
+**How NServiceBus recoverability works**: When a handler throws an exception, NServiceBus core invokes the transport's `onError` callback. The recoverability policy determines the action and NServiceBus core handles message dispatch for delayed retries and error queue moves. The transport only needs to ACK/NAK the original message based on the callback result.
 
-// Consumer config updated:
-// FilterSubjects: ["nsb.events.MyApp-OrderPlaced", "nsb.events.MyApp-OrderCancelled"]
-```
+**Transport responsibilities**:
 
-When subscriptions change, the MessagePump restarts its events consumer to pick up the new filters.
+| `onError` Result | What NServiceBus Core Did | Transport Action |
+|------------------|---------------------------|------------------|
+| `RetryRequired` | Nothing (immediate retry) | `msg.NakAsync(delay: 1s)` - JetStream redelivers |
+| `Handled` | Dispatched delayed retry copy | `msg.AckAsync()` - original removed |
+| `Handled` | Dispatched to error queue | `msg.AckAsync()` - original removed |
 
-## Concurrency Control
+**Delayed retry flow**:
+1. Handler throws exception
+2. NServiceBus core creates a **copy** of the message
+3. Core dispatches the copy via `MessageDispatcher` with `DelayDeliveryWith` property
+4. `SendDelayed()` publishes to central delayed stream with `Nats-Schedule` headers
+5. Core returns `ErrorHandleResult.Handled`
+6. Transport ACKs the original message
+7. NATS delivers the scheduled copy at the retry time via sourcing
 
-Message processing concurrency is controlled by a `SemaphoreSlim`:
+**Delivery tracking**: JetStream tracks delivery attempts via `msg.Metadata.NumDelivered`, which is passed to NServiceBus as the delivery count for recoverability decisions.
 
-```csharp
-// Before processing
-await concurrencyLimiter.WaitAsync(cancellationToken);
-Interlocked.Increment(ref messagesBeingProcessed);
+**Key code**: `MessagePump.ProcessMessage()` handles the ack/nak logic based on `onError` callback results.
 
-// Process message (fire and forget for concurrency)
-_ = ProcessMessageWithConcurrencyTracking(msg, token);
+### Concurrency Control
 
-// After processing (in finally block)
-concurrencyLimiter.Release();
-Interlocked.Decrement(ref messagesBeingProcessed);
-```
+**NServiceBus capability**: Limit concurrent message processing per endpoint.
 
-Dynamic concurrency changes stop and restart the pump with new limits.
+**NATS implementation**: A `SemaphoreSlim` gates message processing. Messages are fetched from JetStream but wait for a concurrency slot before processing.
 
-## Error Handling
+**Dynamic changes**: `MessagePump.ChangeConcurrency()` stops receiving, updates the semaphore, and restarts with new limits.
 
-### Message Processing Errors
+**Key code**: `MessagePump.ProcessIncomingMessage()` acquires the semaphore before spawning processing.
 
-1. Exception thrown during processing
-2. `onError` callback invoked (NServiceBus recoverability)
-3. If `RetryRequired`: `msg.NakAsync(delay: 1s)` for redelivery
-4. If handled: `msg.AckAsync()` (moved to error queue by NServiceBus)
+### Horizontal Scaleout
 
-### Connection Errors
+**NServiceBus capability**: Run multiple instances of the same endpoint to increase throughput.
 
-1. Circuit breaker tracks consecutive failures
-2. Exponential backoff with configurable timeout
-3. If timeout exceeded: critical error callback invoked
-4. NATS.Net handles reconnection automatically
+**NATS implementation**: JetStream's durable consumer model naturally supports competing consumers. All instances of an endpoint share the same consumer name, and JetStream distributes messages across connected instances.
 
-## Header Encoding
+**How it works**:
+1. All instances use the same endpoint name → same stream and consumer name
+2. Each instance calls `consumer.ConsumeAsync()` on the shared durable consumer
+3. JetStream delivers each message to exactly one instance
+4. WorkQueue retention removes messages after ACK
 
-NATS headers are ASCII-only. Non-ASCII characters are encoded using MIME-style Base64:
+**All message types**: Instances share the `{endpoint}-main` consumer. JetStream load-balances unicast messages, sourced events, and sourced delayed messages across all connected instances. Each event is delivered to one instance of each subscribing endpoint (not all instances).
 
-```
-Original: "Ключ"
-Encoded:  "=?UTF-8?B?0JrQu9GO0Yc=?="
-```
+**No configuration required**: Scaleout works automatically - just deploy more instances with the same endpoint name. NATS handles the distribution.
 
-Both keys and values are encoded/decoded transparently.
+**Consumer state**: JetStream tracks which messages have been delivered and to whom. If an instance disconnects without ACKing, messages are redelivered to another instance after `AckWait` timeout (default 30s).
 
-## Subject Naming
+### Transactions
+
+**Not supported**: NATS JetStream doesn't support distributed transactions. The transport operates in `ReceiveOnly` mode - messages are acknowledged after processing, but outgoing messages are sent immediately (not transactionally).
+
+## Stream Topology Summary
+
+| Stream | Purpose | Retention | Subjects | Sources |
+|--------|---------|-----------|----------|---------|
+| `{prefix}-events` | Central events routing | Limits (1hr) | `{prefix}.events.>` | None |
+| `{prefix}-delayed` | Central scheduling | Limits (1hr) | `{prefix}.delayed.>`, `{prefix}.ready.>` | None |
+| `{prefix}-{endpoint}` | Endpoint messages | WorkQueue | `{prefix}.endpoint.{endpoint}` | Delayed + Events |
+| `{prefix}-{endpoint}-error` | Error queue | WorkQueue | `{prefix}.endpoint.{endpoint}-error` | Delayed |
+
+**Stream configuration**:
+- **Events stream**: `AllowMsgSchedules = false`, no Sources
+- **Delayed stream**: `AllowMsgSchedules = true`, no Sources
+- **Endpoint streams**: `AllowMsgSchedules = false`, Sources from delayed and events streams
+
+**Note**: Endpoint streams add Sources dynamically when subscribing to events via `TopologyManager.SubscribeToEvent()`.
+
+## Key Files
+
+| File | Responsibility |
+|------|----------------|
+| `NatsTransport.cs` | Transport configuration, version checking |
+| `TopologyManager.cs` | Stream/consumer CRUD, subscription management (adds sources to streams) |
+| `MessageDispatcher.cs` | Send, publish, delayed delivery |
+| `MessagePump.cs` | Single consumer loop for all message types |
+| `SubscriptionManager.cs` | Track subscriptions, update stream sources via TopologyManager |
+| `NatsTransportDiagnostics.cs` | OpenTelemetry instrumentation |
+
+## NATS-Specific Considerations
+
+### Subject Naming
 
 Type names are sanitized for NATS subjects:
-
 - `.` (namespace separator) → `-`
 - `+` (nested type) → `--`
 
 Example: `MyApp.Orders+OrderPlaced` → `MyApp-Orders--OrderPlaced`
 
-This avoids conflicts with NATS wildcards (`.` is a token separator, `+` is a single-token wildcard).
+### Header Encoding
+
+NATS headers are ASCII-only. Non-ASCII characters use MIME-style Base64 encoding:
+```
+Original: "Schlüssel"
+Encoded:  "=?UTF-8?B?U2NobMO8c3NlbA==?="
+```
+
+### Message Deduplication
+
+JetStream deduplicates by `Nats-Msg-Id` within the stream's duplicate window (2 minutes). The transport uses:
+- **Polymorphic publishes**: `{messageId}-{typeName}` for each type in hierarchy - each type gets its own message
+- **Scheduled messages**: `{messageId}-sched-{timestamp}` - allows multiple delayed retries of the same message
+- **Error queue messages**: `{messageId}-error-{timestamp}` - prevents dedup with original message
+
+### Connection Resilience
+
+The NATS.Net client handles reconnection automatically. A circuit breaker in `MessagePump` tracks consecutive failures and invokes the critical error callback if the configurable timeout is exceeded.
+
+### JetStream Sourcing
+
+Sourcing is a server-side feature that automatically copies messages from one stream to another with optional filtering. Key characteristics:
+- **Automatic**: Happens server-side without client involvement
+- **Filter subjects**: Can filter which messages are copied
+- **Preserves original subject**: Sourced messages retain their original subject
+- **Header added**: `Nats-Stream-Source` header indicates the source stream
+
+**Constraint**: Streams with Sources cannot have `AllowMsgSchedules = true` (mutually exclusive by design). This is why the transport uses separate central streams for events (no scheduling) and delayed (with scheduling).

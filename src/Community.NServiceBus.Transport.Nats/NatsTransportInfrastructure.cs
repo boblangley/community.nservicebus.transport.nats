@@ -48,14 +48,17 @@ sealed class NatsTransportInfrastructure : TransportInfrastructure
         string[] sendingAddresses,
         CancellationToken cancellationToken = default)
     {
-        // Create events stream with Interest retention
-        // This catch-all stream ensures event publishes always succeed
-        // Messages are immediately deleted if no consumer is interested (no unbounded growth)
-        await topologyManager.CreateEventsInfrastructure(cancellationToken);
+        // Create central streams first - endpoint streams source from them
+        // Events stream: captures all published events
+        await topologyManager.CreateEventsStream(cancellationToken);
+        // Delayed stream: handles native NATS scheduling with ready subject delivery
+        await topologyManager.CreateDelayedStream(cancellationToken);
 
         // Create streams and consumers for each receiver
-        // Each endpoint stream captures unicast messages and schedule subjects
-        // AllowMsgSchedules is enabled for native delayed delivery (NATS 2.12+, ADR-51)
+        // Each endpoint stream:
+        // - Captures unicast messages: {prefix}.endpoint.{endpoint}
+        // - Sources from events stream for subscribed event types
+        // - Sources from delayed stream for ready messages: {prefix}.ready.{endpoint}
         foreach (var receiver in receivers)
         {
             var address = ToTransportAddress(receiver.ReceiveAddress);
