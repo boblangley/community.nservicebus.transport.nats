@@ -1,6 +1,8 @@
 namespace NServiceBus;
 
 using System.Text;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using NATS.Client.Core;
 using NATS.Client.JetStream;
 using NServiceBus.DelayedDelivery;
@@ -17,11 +19,13 @@ sealed class MessageDispatcher : IMessageDispatcher
 
     readonly NatsJSContext jetStream;
     readonly TopologyManager topologyManager;
+    readonly ILogger logger;
 
-    public MessageDispatcher(NatsJSContext jetStream, TopologyManager topologyManager)
+    public MessageDispatcher(NatsJSContext jetStream, TopologyManager topologyManager, ILoggerFactory? loggerFactory = null)
     {
         this.jetStream = jetStream;
         this.topologyManager = topologyManager;
+        logger = loggerFactory?.CreateLogger<MessageDispatcher>() ?? NullLogger<MessageDispatcher>.Instance;
     }
 
     public async Task Dispatch(
@@ -117,12 +121,14 @@ sealed class MessageDispatcher : IMessageDispatcher
         catch (NatsJSApiException ex) when (ex.Error.Code == 10504) // Stream not found
         {
             // Stream doesn't exist - create it and retry
+            logger.LogDebug("Stream for destination '{Destination}' not found. Creating stream and retrying publish", destination);
             await topologyManager.EnsureEndpointStreamExists(destination, cancellationToken);
             await jetStream.PublishAsync(subject, body, headers: headers, cancellationToken: cancellationToken);
         }
         catch (NatsJSPublishNoResponseException)
         {
             // No stream matched the subject - create it and retry
+            logger.LogDebug("No stream matched subject for destination '{Destination}'. Creating stream and retrying publish", destination);
             await topologyManager.EnsureEndpointStreamExists(destination, cancellationToken);
             await jetStream.PublishAsync(subject, body, headers: headers, cancellationToken: cancellationToken);
         }

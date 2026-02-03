@@ -114,6 +114,8 @@ public sealed class NatsTransport : TransportDefinition
         string[] sendingAddresses,
         CancellationToken cancellationToken = default)
     {
+        ValidateStreamPrefix(StreamPrefix);
+
         connectionManager = new NatsConnectionManager(
             ConnectionString,
             ConnectionName ?? hostSettings.Name,
@@ -123,7 +125,7 @@ public sealed class NatsTransport : TransportDefinition
         await connectionManager.ConnectAsync(cancellationToken);
 
         var jetStream = connectionManager.JetStream;
-        var topologyManager = new TopologyManager(jetStream, StreamPrefix, AckWait);
+        var topologyManager = new TopologyManager(jetStream, StreamPrefix, AckWait, LoggerFactory);
 
         var infrastructure = new NatsTransportInfrastructure(
             connectionManager,
@@ -147,6 +149,25 @@ public sealed class NatsTransport : TransportDefinition
 
     public override IReadOnlyCollection<TransportTransactionMode> GetSupportedTransactionModes() =>
         [TransportTransactionMode.None, TransportTransactionMode.ReceiveOnly];
+
+    static void ValidateStreamPrefix(string streamPrefix)
+    {
+        if (string.IsNullOrWhiteSpace(streamPrefix))
+        {
+            throw new ArgumentException("StreamPrefix cannot be null, empty, or whitespace.", nameof(streamPrefix));
+        }
+
+        // NATS subject wildcards and delimiters that would break subject routing
+        char[] invalidChars = ['*', '>', '.', ' '];
+        var invalidIndex = streamPrefix.IndexOfAny(invalidChars);
+        if (invalidIndex >= 0)
+        {
+            throw new ArgumentException(
+                $"StreamPrefix contains invalid character '{streamPrefix[invalidIndex]}' at position {invalidIndex}. " +
+                "StreamPrefix cannot contain NATS wildcards ('*', '>'), subject delimiters ('.'), or spaces.",
+                nameof(streamPrefix));
+        }
+    }
 
     void WriteStartupDiagnostics(HostSettings hostSettings, NatsConnectionManager connectionManager)
     {

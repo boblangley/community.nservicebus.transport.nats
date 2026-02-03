@@ -165,4 +165,22 @@ public static class NatsTransportDiagnostics
             { "exception.stacktrace", exception.StackTrace }
         }));
     }
+
+    /// <summary>
+    /// Records that a message was discarded due to TTBR expiration.
+    /// </summary>
+    internal static void RecordMessageExpired(Activity? activity, string messageId)
+    {
+        if (activity == null)
+        {
+            return;
+        }
+
+        activity.SetStatus(ActivityStatusCode.Ok, "Message expired (TTBR)");
+        activity.AddEvent(new ActivityEvent("message.expired", tags: new ActivityTagsCollection
+        {
+            { Attributes.MessagingMessageId, messageId },
+            { "messaging.nats.expiration_reason", "ttbr" }
+        }));
+    }
 }

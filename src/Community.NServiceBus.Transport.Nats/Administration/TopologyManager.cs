@@ -1,6 +1,8 @@
 namespace NServiceBus;
 
 using System.Collections.Concurrent;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using NATS.Client.JetStream;
 using NATS.Client.JetStream.Models;
 
@@ -9,14 +11,16 @@ sealed class TopologyManager
     readonly NatsJSContext jetStream;
     readonly string streamPrefix;
     readonly TimeSpan ackWait;
+    readonly ILogger logger;
     readonly ConcurrentDictionary<string, HashSet<string>> endpointSubscriptions = new();
     readonly SemaphoreSlim subscriptionLock = new(1, 1);
 
-    public TopologyManager(NatsJSContext jetStream, string streamPrefix, TimeSpan ackWait)
+    public TopologyManager(NatsJSContext jetStream, string streamPrefix, TimeSpan ackWait, ILoggerFactory? loggerFactory = null)
     {
         this.jetStream = jetStream;
         this.streamPrefix = streamPrefix;
         this.ackWait = ackWait;
+        logger = loggerFactory?.CreateLogger<TopologyManager>() ?? NullLogger<TopologyManager>.Instance;
     }
 
     public string StreamPrefix => streamPrefix;
@@ -45,11 +49,13 @@ sealed class TopologyManager
         try
         {
             await jetStream.CreateStreamAsync(streamConfig, cancellationToken);
+            logger.LogInformation("Created events stream '{StreamName}'", streamName);
         }
         catch (NatsJSApiException ex) when (ex.Error.Code == 400 && ex.Error.Description?.Contains("already exists") == true)
         {
             // Stream already exists, update it to ensure config is current
             await jetStream.UpdateStreamAsync(streamConfig, cancellationToken);
+            logger.LogDebug("Updated existing events stream '{StreamName}'", streamName);
         }
     }
 
@@ -82,11 +88,13 @@ sealed class TopologyManager
         try
         {
             await jetStream.CreateStreamAsync(streamConfig, cancellationToken);
+            logger.LogInformation("Created delayed stream '{StreamName}'", streamName);
         }
         catch (NatsJSApiException ex) when (ex.Error.Code == 400 && ex.Error.Description?.Contains("already exists") == true)
         {
             // Stream already exists, update it to ensure config is current
             await jetStream.UpdateStreamAsync(streamConfig, cancellationToken);
+            logger.LogDebug("Updated existing delayed stream '{StreamName}'", streamName);
         }
     }
 
@@ -130,6 +138,7 @@ sealed class TopologyManager
         try
         {
             await jetStream.CreateStreamAsync(streamConfig, cancellationToken);
+            logger.LogInformation("Created endpoint stream '{StreamName}' for endpoint '{EndpointName}'", streamName, endpointName);
         }
         catch (NatsJSApiException ex) when (ex.Error.Code == 400 && ex.Error.Description?.Contains("already exists") == true)
         {
@@ -150,6 +159,7 @@ sealed class TopologyManager
             // When updating, explicitly disable AllowMsgSchedules (may have been enabled in older versions)
             streamConfig = streamConfig with { Sources = mergedSources, AllowMsgSchedules = false };
             await jetStream.UpdateStreamAsync(streamConfig, cancellationToken);
+            logger.LogDebug("Updated existing endpoint stream '{StreamName}' for endpoint '{EndpointName}'", streamName, endpointName);
         }
 
         // Consumer receives all messages from the endpoint stream
@@ -172,11 +182,13 @@ sealed class TopologyManager
         try
         {
             await jetStream.CreateConsumerAsync(streamName, consumerConfig, cancellationToken);
+            logger.LogInformation("Created consumer '{ConsumerName}' on stream '{StreamName}'", consumerName, streamName);
         }
         catch (NatsJSApiException ex) when (ex.Error.Code == 400 && ex.Error.Description?.Contains("already exists") == true)
         {
             // Consumer exists - update it
             await jetStream.CreateOrUpdateConsumerAsync(streamName, consumerConfig, cancellationToken);
+            logger.LogDebug("Updated existing consumer '{ConsumerName}' on stream '{StreamName}'", consumerName, streamName);
         }
     }
 
@@ -223,6 +235,7 @@ sealed class TopologyManager
         try
         {
             await jetStream.CreateStreamAsync(streamConfig, cancellationToken);
+            logger.LogDebug("Created stream '{StreamName}' for endpoint '{EndpointName}' (lazy creation)", streamName, endpointName);
         }
         catch (NatsJSApiException ex) when (ex.Error.Code == 400 && ex.Error.Description?.Contains("already exists") == true)
         {
@@ -244,9 +257,11 @@ sealed class TopologyManager
 
             if (!subscriptions.Add(eventSubject))
             {
+                logger.LogDebug("Endpoint '{EndpointName}' already subscribed to '{EventType}'", endpointName, eventType);
                 return; // Already subscribed locally
             }
 
+            logger.LogDebug("Subscribing endpoint '{EndpointName}' to event type '{EventType}'", endpointName, eventType);
             await UpdateStreamSources(endpointName, cancellationToken);
         }
         finally
@@ -271,9 +286,11 @@ sealed class TopologyManager
             var eventSubject = GetEventSubject(eventType);
             if (!subscriptions.Remove(eventSubject))
             {
+                logger.LogDebug("Endpoint '{EndpointName}' not subscribed to '{EventType}', skipping unsubscribe", endpointName, eventType);
                 return; // Not subscribed locally
             }
 
+            logger.LogDebug("Unsubscribing endpoint '{EndpointName}' from event type '{EventType}'", endpointName, eventType);
             await UpdateStreamSources(endpointName, cancellationToken);
         }
         finally
@@ -325,6 +342,7 @@ sealed class TopologyManager
         catch (NatsJSApiException)
         {
             // Stream doesn't exist yet - will be created when endpoint starts
+            logger.LogDebug("Stream '{StreamName}' does not exist yet. Subscription will be applied when endpoint starts", streamName);
             return;
         }
 
