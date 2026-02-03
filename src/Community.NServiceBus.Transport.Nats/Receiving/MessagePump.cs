@@ -2,6 +2,7 @@ namespace NServiceBus;
 
 using System.Text;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using NATS.Client.Core;
 using NATS.Client.JetStream;
 using NServiceBus.Extensibility;
@@ -15,6 +16,7 @@ sealed class MessagePump : IMessageReceiver, IDisposable
     readonly SubscriptionManager subscriptionManager;
     readonly Action<string, Exception, CancellationToken> criticalErrorAction;
     readonly ConnectionFailedCircuitBreaker circuitBreaker;
+    readonly ILogger logger;
 
     OnMessage onMessage = null!;
     OnError onError = null!;
@@ -38,6 +40,7 @@ sealed class MessagePump : IMessageReceiver, IDisposable
         this.receiveAddress = receiveAddress;
         this.topologyManager = topologyManager;
         this.criticalErrorAction = criticalErrorAction;
+        logger = loggerFactory?.CreateLogger<MessagePump>() ?? NullLogger<MessagePump>.Instance;
 
         circuitBreaker = new ConnectionFailedCircuitBreaker(
             $"MessagePump-{receiveAddress}",
@@ -205,6 +208,14 @@ sealed class MessagePump : IMessageReceiver, IDisposable
         {
             await ProcessMessage(msg, cancellationToken);
         }
+        catch (Exception ex)
+        {
+            // This catch handles exceptions that escape ProcessMessage, such as:
+            // - ACK/NAK failures due to network issues
+            // - Unexpected exceptions not caught by inner handlers
+            // The message will be redelivered by NATS since it wasn't acknowledged.
+            logger.LogWarning(ex, "Unhandled exception in message processing. Message will be redelivered by NATS");
+        }
         finally
         {
             concurrencyLimiter?.Release();
@@ -234,7 +245,8 @@ sealed class MessagePump : IMessageReceiver, IDisposable
         // Check for TTBR expiration
         if (IsMessageExpired(originalHeaders))
         {
-            // Message has expired - ack without processing
+            logger.LogDebug("Message '{MessageId}' has expired (TTBR). Discarding without processing", messageId);
+            NatsTransportDiagnostics.RecordMessageExpired(activity, messageId);
             await msg.AckAsync(cancellationToken: CancellationToken.None);
             return;
         }
@@ -301,6 +313,8 @@ sealed class MessagePump : IMessageReceiver, IDisposable
             catch (Exception onErrorEx)
             {
                 // Error handler failed - invoke critical error and NAK the message
+                logger.LogError(onErrorEx, "Recoverability policy failed for message '{MessageId}'. Message will be retried. Invoking critical error action", messageId);
+                NatsTransportDiagnostics.RecordException(activity, onErrorEx);
                 criticalErrorAction(
                     $"Failed to execute recoverability policy for message with native ID: `{messageId}`",
                     onErrorEx,

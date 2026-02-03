@@ -40,7 +40,7 @@ sealed class NatsTransportInfrastructure : TransportInfrastructure
                 return (IMessageReceiver)pump;
             });
 
-        Dispatcher = new MessageDispatcher(jetStream, topologyManager);
+        Dispatcher = new MessageDispatcher(jetStream, topologyManager, loggerFactory);
     }
 
     public async Task SetupInfrastructure(
