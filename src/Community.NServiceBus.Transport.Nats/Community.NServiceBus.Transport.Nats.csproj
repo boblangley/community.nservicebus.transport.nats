@@ -34,7 +34,7 @@
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.3" />
     <PackageReference Include="Microsoft.SourceLink.GitHub" Version="10.0.103" PrivateAssets="All" />
     <PackageReference Include="NServiceBus" Version="10.1.0" />
-    <PackageReference Include="NATS.Net" Version="2.7.2" />
+    <PackageReference Include="NATS.Net" Version="2.7.3" />
   </ItemGroup>
 
   <ItemGroup>
