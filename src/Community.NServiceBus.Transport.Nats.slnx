@@ -1,4 +1,6 @@
 <Solution>
+  <Project Path="Community.NServiceBus.Transport.Nats.AcceptanceTests/Community.NServiceBus.Transport.Nats.AcceptanceTests.csproj" />
+  <Project Path="Community.NServiceBus.Transport.Nats.Tests/Community.NServiceBus.Transport.Nats.Tests.csproj" />
   <Project Path="Community.NServiceBus.Transport.Nats/Community.NServiceBus.Transport.Nats.csproj" />
   <Project Path="Community.NServiceBus.Transport.Nats.TransportTests/Community.NServiceBus.Transport.Nats.TransportTests.csproj" />
 </Solution>
