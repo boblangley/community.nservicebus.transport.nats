@@ -77,6 +77,13 @@ foreach (var typeName in typeHierarchy)
 
 ### CI/CD Pattern
 
+Release versions and pending changes are managed by Intentional. Read
+`.intentional/config.yml`, run `intentional status` and `intentional check`,
+and use `intentional skill` for the CLI's agent workflow. Add an intent for
+consumer-facing changes to release unit `nats-transport`; do not change its
+project version manually. See [docs/releasing.md](docs/releasing.md) before
+preparing a release.
+
 Follows Particular's conventions:
 - Version tags without `v` prefix: `1.0.0`, `1.0.0-beta1`
 - PowerShell as default shell in workflows

@@ -1,0 +1,30 @@
+$schema: https://intentional.foo/schemas/config.yml
+contract: contract-2
+settings:
+  internal-dependency-bump: patch
+discovery:
+  managed-paths:
+  - detector: msbuild-project
+    path: src/Community.NServiceBus.Transport.Nats/Community.NServiceBus.Transport.Nats.csproj
+    release-unit: nats-transport
+  excluded-paths:
+  - detector: msbuild-project
+    path: src/Community.NServiceBus.Transport.Nats.AcceptanceTests/Community.NServiceBus.Transport.Nats.AcceptanceTests.csproj
+    evidence-digest: sha256:b23a71432c02bb6c20ed6ebd25196c432208391618aa72feb32061761ecdb2e9
+  - detector: msbuild-project
+    path: src/Community.NServiceBus.Transport.Nats.Tests/Community.NServiceBus.Transport.Nats.Tests.csproj
+    evidence-digest: sha256:924e7a65baa934c99eb5136c519d24e7736b227f2361d99486930d2b3acc1cec
+  - detector: msbuild-project
+    path: src/Community.NServiceBus.Transport.Nats.TransportTests/Community.NServiceBus.Transport.Nats.TransportTests.csproj
+    evidence-digest: sha256:51e6c08c165b5248196b0e0575ed6604cdf95855ad18c52e4b2d6b9c2f0c2025
+release-units:
+  nats-transport:
+    path: src/Community.NServiceBus.Transport.Nats
+    projections:
+    - adapter: msbuild
+      file: Community.NServiceBus.Transport.Nats.csproj
+      mode: committed
+    tags:
+      primary:
+        role: primary
+        template: '{version}'

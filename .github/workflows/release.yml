@@ -39,14 +39,13 @@ jobs:
         uses: actions/setup-dotnet@v5
         with:
           global-json-file: global.json
-      - name: Extract version from tag
-        id: version
-        run: |
-          $version = "${{ github.ref_name }}"
-          Write-Host "Version: $version"
-          echo "VERSION=$version" >> $env:GITHUB_OUTPUT
+      - name: Validate release state
+        uses: wyrd-company/intentional@0.4.1
+        with:
+          intentional-version: 0.4.1
+          command: check
       - name: Build
-        run: dotnet build src/Community.NServiceBus.Transport.Nats.slnx --configuration Release -p:Version=${{ steps.version.outputs.VERSION }}
+        run: dotnet build src/Community.NServiceBus.Transport.Nats.slnx --configuration Release
       - name: Run Unit Tests
         run: dotnet test src/Community.NServiceBus.Transport.Nats.Tests --configuration Release --verbosity normal
       - name: Run Transport Tests

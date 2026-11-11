@@ -12,6 +12,22 @@ defaults:
   run:
     shell: pwsh
 jobs:
+  intentional:
+    name: Intentional
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Validate release state
+        uses: wyrd-company/intentional@0.4.1
+        with:
+          intentional-version: 0.4.1
+          command: check
+
   build:
     name: Build
     runs-on: windows-latest

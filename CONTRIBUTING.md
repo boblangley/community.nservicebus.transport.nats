@@ -49,7 +49,29 @@ dotnet test src/Community.NServiceBus.Transport.Nats.AcceptanceTests
 2. Create a feature branch from `main`
 3. Make your changes
 4. Ensure all tests pass
-5. Submit a pull request
+5. Add an Intentional change intent for changes that affect package consumers
+6. Submit a pull request
+
+### Change intents and releases
+
+We use [Intentional](https://github.com/wyrd-company/intentional) to manage
+the `nats-transport` release unit. Install the version used in CI:
+
+```bash
+npm install --global @wyrd-company/intentional@0.4.1
+```
+
+Declare a consumer-facing fix with:
+
+```bash
+intentional add --release-unit nats-transport:patch --message "Describe the fix for users."
+intentional check
+```
+
+Use `minor` for new capabilities and `major` for breaking changes. Commit the
+generated file in `.intentional/intents/` with the implementation. Documentation
+and CI-only changes do not need an intent. Do not edit the package version by
+hand; see [the release procedure](docs/releasing.md).
 
 ### Code Guidelines
 
