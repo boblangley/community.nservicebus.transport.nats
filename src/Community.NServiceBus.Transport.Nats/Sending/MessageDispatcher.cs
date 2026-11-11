@@ -328,6 +328,13 @@ sealed class MessageDispatcher : IMessageDispatcher
         var headers = new NatsHeaders();
         foreach (var kvp in nsbHeaders)
         {
+            // JetStream adds scheduling and sourcing control headers on delivery.
+            // Replaying them can purge an earlier schedule or suppress a retry.
+            if (kvp.Key.StartsWith("Nats-", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
             // Skip null values - some headers may be intentionally set to null
             if (kvp.Value == null)
             {
