@@ -52,7 +52,7 @@ Endpoint streams use Sources (server-side message copying) to receive events and
 
 ```bash
 # Start NATS (devcontainer has this pre-configured)
-docker run -d --name nats -p 4222:4222 nats:2.12-alpine --jetstream
+docker run -d --name nats -p 4222:4222 nats:2.15.2-alpine --jetstream
 
 # Run tests
 dotnet test src/Community.NServiceBus.Transport.Nats.TransportTests

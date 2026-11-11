@@ -32,7 +32,7 @@ docker run -d \
   -p 4222:4222 \
   -p 8222:8222 \
   -v nats-data:/data \
-  nats:2.12-alpine \
+  nats:2.15.2-alpine \
   --jetstream \
   --store_dir /data \
   -m 8222
