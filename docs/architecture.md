@@ -63,7 +63,7 @@ class OrderPlaced : OrderEvent, IOrderEvent { }
 
 **Note**: An endpoint subscribing to multiple types in the same hierarchy will receive multiple copies of the message. This is consistent with other message broker behavior.
 
-**Subscription management**: When an endpoint subscribes to an event type, `TopologyManager.SubscribeToEvent()` adds a Source from the events stream with the appropriate filter subject.
+**Subscription management**: `TopologyManager.SubscribeToEvent()` updates a single Source from the events stream. Identity subject transforms filter the subscribed event subjects while preserving their original names. Keeping the filters on one source ensures concurrent event types share a source cursor.
 
 **Benefits**:
 - Single consumer per endpoint simplifies concurrency control

@@ -301,7 +301,7 @@ sealed class TopologyManager
 
     /// <summary>
     /// Updates the endpoint stream's sources to reflect current subscriptions.
-    /// Each subscription becomes a source from the events stream with a filter_subject.
+    /// Event subscriptions share one source with identity subject transforms as filters.
     /// The delayed stream source is always preserved.
     /// </summary>
     async Task UpdateStreamSources(string endpointName, CancellationToken cancellationToken)
@@ -320,17 +320,19 @@ sealed class TopologyManager
             }
         };
 
-        // Add event sources from current subscriptions
-        if (endpointSubscriptions.TryGetValue(endpointName, out var subscriptions))
+        // Use one source cursor for all event subjects. Independent sources from
+        // the same stream can skip concurrently published events during updates.
+        if (endpointSubscriptions.TryGetValue(endpointName, out var subscriptions) && subscriptions.Count > 0)
         {
-            foreach (var eventSubject in subscriptions)
+            sources.Add(new StreamSource
             {
-                sources.Add(new StreamSource
+                Name = eventsStreamName,
+                SubjectTransforms = subscriptions.Select(subject => new SubjectTransform
                 {
-                    Name = eventsStreamName,
-                    FilterSubject = eventSubject
-                });
-            }
+                    Src = subject,
+                    Dest = subject
+                }).ToList()
+            });
         }
 
         // Read existing stream config and update sources
