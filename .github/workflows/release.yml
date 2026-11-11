@@ -46,7 +46,7 @@ jobs:
           Write-Host "Version: $version"
           echo "VERSION=$version" >> $env:GITHUB_OUTPUT
       - name: Build
-        run: dotnet build src/Community.NServiceBus.Transport.Nats --configuration Release -p:Version=${{ steps.version.outputs.VERSION }}
+        run: dotnet build src/Community.NServiceBus.Transport.Nats.slnx --configuration Release -p:Version=${{ steps.version.outputs.VERSION }}
       - name: Run Unit Tests
         run: dotnet test src/Community.NServiceBus.Transport.Nats.Tests --configuration Release --verbosity normal
       - name: Run Transport Tests
