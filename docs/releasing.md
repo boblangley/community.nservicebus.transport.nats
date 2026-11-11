@@ -50,7 +50,7 @@ solution against the NATS version documented in the README:
 
 ```bash
 dotnet build src/Community.NServiceBus.Transport.Nats.slnx --configuration Release
-dotnet test src/Community.NServiceBus.Transport.Nats.slnx --configuration Release --no-build
+NATS_CONNECTION_STRING=nats://localhost:4222 dotnet test src/Community.NServiceBus.Transport.Nats.slnx --configuration Release --no-build
 intentional check
 ```
 
