@@ -14,6 +14,7 @@ This is a community-maintained transport implementation that enables NServiceBus
 - [Configuration Guide](docs/configuration.md) - How to configure and use the transport
 - [Operations Guide](docs/operations.md) - Deployment, NATS CLI commands, and infrastructure setup
 - [Architecture](docs/architecture.md) - Technical implementation details for contributors
+- [Changelog](src/Community.NServiceBus.Transport.Nats/CHANGELOG.md) - Release history and upgrade notes
 - [Releasing](docs/releasing.md) - Intentional change intents and release procedure
 
 ## Running tests locally
