@@ -70,3 +70,31 @@ Push the generated tag only when publication is intended. The existing Release
 workflow validates Intentional state, builds the committed package version,
 runs all three test suites, publishes to NuGet, and creates a GitHub Release.
 Intentional does not commit, push, or publish packages itself.
+
+## NuGet trusted publishing
+
+The Release workflow uses GitHub Actions OIDC through `NuGet/login@v1` to
+obtain a short-lived NuGet API key immediately before publication. It requires
+`id-token: write` and uses the NuGet username `boblangley`. No stored
+`NUGET_API_KEY` secret is required.
+
+The policy on nuget.org must match:
+
+- Repository owner: `boblangley`
+- Repository: `community.nservicebus.transport.nats`
+- Workflow filename: `release.yml` (without `.github/workflows/`)
+- Environment: empty (this workflow does not use a GitHub environment)
+- Package scope: allow publishing new versions of `Community.NServiceBus.Transport.Nats`
+
+To retry publication after a workflow or authentication fix has landed on
+`main`, dispatch the updated workflow against an existing release tag:
+
+```bash
+gh workflow run release.yml --ref main --field tag=2.0.1
+```
+
+The workflow checks out that tag, verifies that its commit is on `main`, and
+builds and tests the tagged source before publishing. It creates or updates the
+GitHub Release for the same tag. Do not move or recreate an existing tag.
+Rerunning an old failed workflow run uses its original workflow definition and
+will not pick up authentication fixes committed later.

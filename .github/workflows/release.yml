@@ -1,11 +1,21 @@
 name: Release
 on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to publish
+        required: true
+        type: string
   push:
     tags:
       - '[0-9]+.[0-9]+.[0-9]+'
       - '[0-9]+.[0-9]+.[0-9]+-*'
 permissions:
   contents: write
+  id-token: write
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 env:
   DOTNET_NOLOGO: true
 defaults:
@@ -14,7 +24,14 @@ defaults:
 jobs:
   release:
     runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
+      - name: Validate release tag
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$') {
+            throw "Expected a bare SemVer release tag, got '$env:RELEASE_TAG'."
+          }
       - name: Start NATS with JetStream
         run: |
           docker run -d --name nats -p 4222:4222 -p 8222:8222 nats:2.15.2-alpine --jetstream -m 8222
@@ -35,6 +52,13 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
+      - name: Verify release is on main
+        run: |
+          git merge-base --is-ancestor HEAD origin/main
+          if ($LASTEXITCODE -ne 0) {
+            throw "Release tag '$env:RELEASE_TAG' must point to a commit on main."
+          }
       - name: Setup .NET SDK
         uses: actions/setup-dotnet@v5
         with:
@@ -62,10 +86,18 @@ jobs:
           name: nugets
           path: nugets/*
           retention-days: 30
+      - name: Log in to NuGet with OIDC
+        uses: NuGet/login@v1
+        id: nuget-login
+        with:
+          user: boblangley
       - name: Push to NuGet
-        run: dotnet nuget push nugets/*.nupkg --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
+        run: dotnet nuget push nugets/*.nupkg --api-key $env:NUGET_API_KEY --source https://api.nuget.org/v3/index.json --skip-duplicate
+        env:
+          NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
           files: nugets/*
           generate_release_notes: true
