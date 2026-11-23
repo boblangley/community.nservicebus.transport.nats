@@ -23,7 +23,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Validate release state
-        uses: wyrd-company/intentional@0.4.1
+        uses: wyrd-company/intentional@0.5.0
         with:
           intentional-version: 0.4.1
           command: check
